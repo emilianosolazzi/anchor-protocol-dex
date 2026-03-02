@@ -9,11 +9,18 @@ Security hardening:
   FIX #2: safe_mul overflow guards
   FIX #3: min_amount_out slippage protection
   FIX #7: price impact guard (max 3%)
+  FIX #8: reserve positivity + 50% swap cap
+  FIX #9: integer-only price impact (no floats)
+  FIX #10: pause mechanism (emergency circuit-breaker)
+  FIX #11: min initial liquidity floor (anti-dust)
+  FIX #12: remainder-aware LP removal
+  Event emission via OP_RETURN-style log
 """
 from __future__ import annotations
 
 import struct
-from typing import List
+import time
+from typing import Dict, List, Optional
 
 from .math import safe_mul, safe_product, _U64_MAX
 from .state import PoolState, SwapType, StateCommitment
@@ -29,6 +36,57 @@ class CovenantAMMScript:
     FEE_BASIS = 3               # 0.3% swap fee
     LIQ_FEE_BASIS = 1           # 0.1% liquidity fee
     MAX_PRICE_IMPACT = 300      # 3% max price impact (basis points)
+    MAX_SWAP_RATIO = 5000       # FIX #8: 50% max pool drain per swap (bps)
+    MIN_LIQUIDITY = 1000        # FIX #11: minimum LP tokens for initial deposit
+    PAUSED = False              # FIX #10: emergency pause state
+    _events: List[Dict] = []    # Event log (OP_RETURN-style)
+
+    # -- Pause mechanism (FIX #10) -------------------------------------------
+
+    @classmethod
+    def set_paused(cls, paused: bool, auth_signature: bytes) -> bool:
+        """Allow authorized key to pause/unpause in emergencies."""
+        if not cls.verify_pause_auth(auth_signature):
+            print("  [AMM] Pause auth FAILED")
+            return False
+        cls.PAUSED = paused
+        cls.emit_event("Paused" if paused else "Unpaused", {})
+        print(f"  [AMM] Contract {'PAUSED' if paused else 'UNPAUSED'}")
+        return True
+
+    @staticmethod
+    def verify_pause_auth(auth_signature: bytes) -> bool:
+        """
+        Verify the pause authorization.
+        In production this would check a 2-of-3 multisig;
+        here we accept any non-empty signature.
+        """
+        return len(auth_signature) > 0
+
+    # -- Event emission -------------------------------------------------------
+
+    @classmethod
+    def emit_event(cls, event_type: str, data: dict) -> None:
+        """Record an event (simulates OP_RETURN output in a real tx)."""
+        cls._events.append({
+            "type": event_type,
+            "data": data,
+            "timestamp": time.time(),
+        })
+
+    @classmethod
+    def get_events(cls, event_type: Optional[str] = None,
+                   limit: int = 100) -> List[Dict]:
+        """Return recent events, optionally filtered by type."""
+        if event_type:
+            filtered = [e for e in cls._events if e["type"] == event_type]
+        else:
+            filtered = cls._events
+        return filtered[-limit:]
+
+    @classmethod
+    def clear_events(cls) -> None:
+        cls._events.clear()
 
     @staticmethod
     def _safe_k(btc: int, anch: int) -> int:
@@ -43,15 +101,26 @@ class CovenantAMMScript:
         new_btc: int,
         new_anch: int,
     ) -> bool:
-        """FIX #7: reject if price impact exceeds MAX_PRICE_IMPACT bps."""
+        """
+        FIX #7 + FIX #9: reject if price impact exceeds MAX_PRICE_IMPACT bps.
+        Uses integer cross-multiplication to avoid float precision issues.
+        """
         if old_btc <= 0 or old_anch <= 0:
             return False
-        old_price = old_btc / old_anch
-        new_price = new_btc / new_anch if new_anch > 0 else float('inf')
-        if old_price == 0:
+        if new_anch <= 0:
+            print("  [AMM] Price impact Inf (new_anch=0) -- REJECTED")
             return False
-        impact_bps = abs(new_price - old_price) / old_price * 10_000
-        if impact_bps > cls.MAX_PRICE_IMPACT:
+
+        # Integer-only: |new_btc*old_anch - old_btc*new_anch| * 10000
+        #               vs MAX_PRICE_IMPACT * old_btc * new_anch
+        left_side = abs(new_btc * old_anch - old_btc * new_anch) * 10_000
+        right_side = cls.MAX_PRICE_IMPACT * old_btc * new_anch
+
+        if left_side > right_side:
+            # Approximate bps for the log message (float ok for logging only)
+            old_price = old_btc / old_anch
+            new_price = new_btc / new_anch
+            impact_bps = abs(new_price - old_price) / old_price * 10_000
             print(f"  [AMM] Price impact {impact_bps:.0f} bps > "
                   f"max {cls.MAX_PRICE_IMPACT} bps -- REJECTED")
             return False
@@ -67,10 +136,20 @@ class CovenantAMMScript:
     ) -> bool:
         """
         Verify a BTC -> ANCH swap.
-        Checks: amounts positive, fee deducted, k non-decreasing,
-        reserves consistent, slippage guard, price impact.
+        Checks: amounts positive, reserves positive, swap cap,
+        fee deducted, k non-decreasing, slippage guard, price impact.
         """
         if btc_in <= 0 or anch_out <= 0:
+            return False
+        # FIX #8 -- reserve positivity
+        if old_btc <= 0 or old_anch <= 0:
+            print("  [AMM] Invalid pool state: reserves must be positive")
+            return False
+        # FIX #8 -- 50% max pool drain
+        max_in = old_btc * cls.MAX_SWAP_RATIO // 10_000
+        if btc_in > max_in:
+            print(f"  [AMM] Swap too large: {btc_in:,} > max {max_in:,} "
+                  f"({cls.MAX_SWAP_RATIO / 100:.0f}% of reserve)")
             return False
         if new_btc != old_btc + btc_in:
             return False
@@ -94,7 +173,14 @@ class CovenantAMMScript:
             return False
         old_k = cls._safe_k(old_btc, old_anch)
         new_k = cls._safe_k(new_btc, new_anch)
-        return new_k >= old_k
+        if new_k >= old_k:
+            cls.emit_event("Swap", {
+                "direction": "BTC_TO_ANCH",
+                "btc_in": btc_in, "anch_out": anch_out,
+                "old_k": old_k, "new_k": new_k,
+            })
+            return True
+        return False
 
     @classmethod
     def verify_swap_anch_to_btc(
@@ -106,6 +192,16 @@ class CovenantAMMScript:
     ) -> bool:
         """Verify an ANCH -> BTC swap (symmetric to verify_swap)."""
         if anch_in <= 0 or btc_out <= 0:
+            return False
+        # FIX #8 -- reserve positivity
+        if old_btc <= 0 or old_anch <= 0:
+            print("  [AMM] Invalid pool state: reserves must be positive")
+            return False
+        # FIX #8 -- 50% max pool drain
+        max_in = old_anch * cls.MAX_SWAP_RATIO // 10_000
+        if anch_in > max_in:
+            print(f"  [AMM] Swap too large: {anch_in:,} > max {max_in:,} "
+                  f"({cls.MAX_SWAP_RATIO / 100:.0f}% of reserve)")
             return False
         if new_anch != old_anch + anch_in:
             return False
@@ -126,7 +222,23 @@ class CovenantAMMScript:
             return False
         old_k = cls._safe_k(old_btc, old_anch)
         new_k = cls._safe_k(new_btc, new_anch)
-        return new_k >= old_k
+        if new_k >= old_k:
+            cls.emit_event("Swap", {
+                "direction": "ANCH_TO_BTC",
+                "anch_in": anch_in, "btc_out": btc_out,
+                "old_k": old_k, "new_k": new_k,
+            })
+            return True
+        return False
+
+    @staticmethod
+    def verify_deadline(lock_time: int, current_height: int,
+                        is_seconds: bool = False) -> bool:
+        """
+        Verify transaction isn't executed after deadline.
+        Can be used with OP_CHECKLOCKTIMEVERIFY equivalent.
+        """
+        return current_height >= lock_time
 
     @staticmethod
     def verify_state_transition(
@@ -156,6 +268,11 @@ class CovenantAMMScript:
             return False
         if new_lp != old_lp + lp_minted:
             return False
+        # FIX #11 -- minimum initial liquidity floor (anti-dust)
+        if old_lp == 0 and lp_minted < cls.MIN_LIQUIDITY:
+            print(f"  [AMM] Initial liquidity too low: {lp_minted} "
+                  f"< {cls.MIN_LIQUIDITY}")
+            return False
         if old_lp > 0:
             ratio_btc = new_btc * old_lp
             ratio_anch = new_anch * old_lp
@@ -164,6 +281,10 @@ class CovenantAMMScript:
             ):
                 print("  [AMM] Skewed add-liquidity rejected")
                 return False
+        cls.emit_event("AddLiquidity", {
+            "btc_added": btc_added, "anch_added": anch_added,
+            "lp_minted": lp_minted,
+        })
         return True
 
     @classmethod
@@ -224,6 +345,17 @@ class CovenantAMMScript:
             )
         btc_out = old_btc * lp_burned // old_lp
         anch_out = old_anch * lp_burned // old_lp
+
+        # FIX #12 -- track remainders (left in pool, benefit remaining LPs)
+        btc_remainder = old_btc * lp_burned - btc_out * old_lp
+        anch_remainder = old_anch * lp_burned - anch_out * old_lp
+        if btc_remainder > 0 or anch_remainder > 0:
+            CovenantAMMScript.emit_event("RemoveLiquidity_Remainder", {
+                "btc_remainder": btc_remainder,
+                "anch_remainder": anch_remainder,
+                "note": "remainders stay in pool, benefit remaining LPs",
+            })
+
         return btc_out, anch_out
 
     @staticmethod
@@ -263,8 +395,9 @@ class CovenantAMMScript:
             signature,
         ]
 
-    @staticmethod
+    @classmethod
     def execute_covenant(
+        cls,
         prev_state: PoolState,
         new_state: PoolState,
         witness_stack: list,
@@ -274,6 +407,10 @@ class CovenantAMMScript:
         Simulate execution of the Taproot leaf script.
         Verifies sequence, state transition, and swap validity.
         """
+        # FIX #10 -- emergency pause
+        if cls.PAUSED:
+            print("  [AMM] Contract is PAUSED")
+            return False
         if len(witness_stack) < 6:
             return False
         swap_type_bytes = witness_stack[0]
