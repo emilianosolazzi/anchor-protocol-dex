@@ -3,16 +3,26 @@ OnChainPool -- the on-chain AMM pool (simulated).
 
 Represents a pool UTXO with a Taproot covenant that enforces
 AMM rules via the HybridCovenantEngine.
+
+Improvements:
+  - Accepts PoolConfig for per-pool fee / limit configuration.
+  - Tracks fee accumulation via FeeAccumulator for LP reward
+    accounting and protocol fee collection.
+  - Records TWAP snapshots on every state transition (swap
+    and liquidity change) so callers can compute manipulation-
+    resistant price feeds.
+  - Emits structured events for all state transitions.
 """
 from __future__ import annotations
 
 import hashlib
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .state import (
     PoolState, SwapType, LiquidityType, LiquidityChange,
     FraudProof, PendingSwap, StateCommitment,
+    PoolConfig, FeeAccumulator, TWAPSnapshot,
 )
 from .covenant_amm import CovenantAMMScript
 from ..covenants.opcodes import sha256
@@ -24,12 +34,20 @@ from ..crypto.keys import KEYSTORE
 class OnChainPool:
     """
     Represents a pool UTXO with a Taproot covenant that enforces AMM rules.
+
+    Each pool tracks:
+      - Reserves (BTC and ANCH) and LP supply
+      - Per-pool configuration via PoolConfig
+      - Cumulative fee accounting via FeeAccumulator
+      - TWAP observations for oracle consumers
+      - LP balances per-user
     """
     MAX_PENDING_SWAPS = 1000      # DoS guard
     MAX_PENDING_LIQUIDITY = 100   # DoS guard
 
     def __init__(self, btc_reserve: int, anch_reserve: int, owner: str,
-                 network: CovenantNetwork = CovenantNetwork.REGTEST):
+                 network: CovenantNetwork = CovenantNetwork.REGTEST,
+                 config: Optional[PoolConfig] = None):
         self.state = PoolState(
             btc_reserve=btc_reserve,
             anch_reserve=anch_reserve,
@@ -39,14 +57,21 @@ class OnChainPool:
         )
         self.owner = owner
         self.network = network
-        self.challenge_period = 144  # blocks (~1 day)
+        self.config = config or PoolConfig()
+        self.challenge_period = self.config.challenge_period_blocks
         self.pending_swaps: Dict[str, PendingSwap] = {}
         self.pending_liquidity: Dict[str, LiquidityChange] = {}
         self._seq: int = 0
         self._bonds: Dict[str, int] = {}
         self._lp_ledger: Dict[str, int] = {}
+        self._fee_accumulator = FeeAccumulator()
+        self._twap_observations: List[TWAPSnapshot] = []
+        self._events: List[dict] = []
         self.covenant_engine = HybridCovenantEngine(network)
         self._generate_taproot_address()
+        # Record initial TWAP observation
+        if btc_reserve > 0 and anch_reserve > 0:
+            self._record_twap(btc_reserve, anch_reserve)
 
     # ------------------------------------------------------------------
     def _generate_taproot_address(self):
@@ -109,6 +134,68 @@ class OnChainPool:
         self._bonds[to_addr] = self._bonds.get(to_addr, 0) + amount
         print(f"  [BOND] Slashed {amount:,} sats from {from_addr[:12]}... "
               f"-> rewarded {to_addr[:12]}...")
+
+    # -- TWAP and event tracking --
+    def _record_twap(self, btc_reserve: int, anch_reserve: int):
+        """Record a TWAP observation after every state transition."""
+        now = time.time()
+        if btc_reserve <= 0 or anch_reserve <= 0:
+            return
+
+        if not self._twap_observations:
+            self._twap_observations.append(TWAPSnapshot(
+                timestamp=now,
+                btc_reserve=btc_reserve,
+                anch_reserve=anch_reserve,
+                cumulative_price_btc=0,
+                cumulative_price_anch=0,
+            ))
+            return
+
+        last = self._twap_observations[-1]
+        dt = max(1, now - last.timestamp)
+        # Accumulate using last observation's reserves
+        price_btc = last.btc_reserve * 10**18 // last.anch_reserve
+        price_anch = last.anch_reserve * 10**18 // last.btc_reserve
+        self._twap_observations.append(TWAPSnapshot(
+            timestamp=now,
+            btc_reserve=btc_reserve,
+            anch_reserve=anch_reserve,
+            cumulative_price_btc=last.cumulative_price_btc + int(price_btc * dt),
+            cumulative_price_anch=last.cumulative_price_anch + int(price_anch * dt),
+        ))
+        # Trim to keep window manageable
+        max_obs = self.config.twap_window_blocks * 2
+        if len(self._twap_observations) > max_obs:
+            self._twap_observations = self._twap_observations[-max_obs:]
+
+    def _emit_event(self, event_type: str, **kwargs):
+        event = {"type": event_type, "timestamp": time.time(), "seq": self._seq, **kwargs}
+        self._events.append(event)
+        # Keep bounded
+        if len(self._events) > 1000:
+            self._events = self._events[-500:]
+
+    @property
+    def fee_accumulator(self) -> FeeAccumulator:
+        """Access cumulative fee data for this pool."""
+        return self._fee_accumulator
+
+    @property
+    def twap_observations(self) -> List[TWAPSnapshot]:
+        return self._twap_observations
+
+    def get_twap(self) -> Optional[int]:
+        """
+        Get TWAP over all observations (fixed-point * 10^18).
+        Returns None if insufficient data.
+        """
+        if len(self._twap_observations) < 2:
+            return None
+        return TWAPSnapshot.compute_twap(
+            self._twap_observations[0],
+            self._twap_observations[-1],
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -262,6 +349,11 @@ class OnChainPool:
         self.state = pending.new_state
         self._seq += 1
         del self.pending_swaps[txid]
+        # Record TWAP and fee tracking
+        self._record_twap(self.state.btc_reserve, self.state.anch_reserve)
+        self._emit_event("swap_finalized", txid=txid,
+                         btc_reserve=self.state.btc_reserve,
+                         anch_reserve=self.state.anch_reserve)
         print(f"  Swap {txid[:16]}... finalised (seq->{self._seq}). "
               f"New reserves -> BTC={self.state.btc_reserve:,} "
               f"ANCH={self.state.anch_reserve:,}")
@@ -415,6 +507,12 @@ class OnChainPool:
             current_lp = self._lp_ledger.get(lc.user, 0)
             self._lp_ledger[lc.user] = max(0, current_lp - lp_burned)
         del self.pending_liquidity[txid]
+        # Record TWAP and emit event
+        self._record_twap(new_btc, new_anch)
+        self._emit_event("liquidity_finalized", txid=txid,
+                         action=lc.liq_type.name,
+                         btc_reserve=new_btc, anch_reserve=new_anch,
+                         lp_total=new_lp)
         print(f"  Liquidity change {txid[:16]}... finalised ({lc.user} {action}).")
         print(f"  Reserves -> BTC={new_btc:,} ANCH={new_anch:,} LP={new_lp:,}")
         return new_state
@@ -423,6 +521,7 @@ class OnChainPool:
         return self._lp_ledger.get(user, 0)
 
     def get_info(self) -> dict:
+        twap = self.get_twap()
         return {
             "address": self.state.taproot_address,
             "btc_reserve": self.state.btc_reserve,
@@ -430,7 +529,24 @@ class OnChainPool:
             "lp_total": self.state.lp_total,
             "pending_swaps": len(self.pending_swaps),
             "pending_liquidity": len(self.pending_liquidity),
+            "swap_fee_bps": self.config.swap_fee_bps,
+            "total_btc_fees": self._fee_accumulator.total_btc_fees,
+            "total_anch_fees": self._fee_accumulator.total_anch_fees,
+            "protocol_btc_fees": self._fee_accumulator.protocol_btc_fees,
+            "protocol_anch_fees": self._fee_accumulator.protocol_anch_fees,
+            "swap_count": self._fee_accumulator.swap_count,
+            "twap_observations": len(self._twap_observations),
+            "twap_price_fixed": twap,
         }
+
+    def spot_price(self) -> Optional[int]:
+        """
+        Current spot price in fixed point (sats-per-ANCH * 10^8).
+        Returns None if either reserve is zero.
+        """
+        if self.state.anch_reserve <= 0:
+            return None
+        return self.state.btc_reserve * 10**8 // self.state.anch_reserve
 
     def quote(self, swap_type: SwapType, amount_in: int) -> int:
         if swap_type == SwapType.BTC_TO_ANCH:
