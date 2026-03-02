@@ -13,7 +13,7 @@ Security hardening:
   FIX #1: sequence-based replay protection
   FIX #2: safe_mul overflow guards (now with safe_add, safe_sub, isqrt)
   FIX #3: min_amount_out slippage protection
-  FIX #7: price impact guard (max 3%, configurable via PoolConfig)
+  FIX #7: price impact guard (max 15%, configurable via PoolConfig)
   FIX #8: reserve positivity + 50% swap cap
   FIX #9: integer-only price impact (no floats in consensus path)
   FIX #10: pause mechanism (emergency circuit-breaker)
@@ -53,10 +53,10 @@ class CovenantAMMScript:
     """
 
     # Default parameters (overridden by PoolConfig when available)
-    FEE_BASIS = 30              # 0.30% swap fee (in BPS / 10 for legacy compat)
+    FEE_BASIS = 3               # 0.30% swap fee (3 / 1000 = 0.3%)
     PROTOCOL_FEE_BPS = 5        # 0.05% protocol fee (from swap fee)
     LIQ_FEE_BASIS = 1           # 0.1% liquidity fee
-    MAX_PRICE_IMPACT = 300      # 3% max price impact (basis points)
+    MAX_PRICE_IMPACT = 1500     # 15% max price impact (basis points)
     MAX_SWAP_RATIO = 5000       # FIX #8: 50% max pool drain per swap (bps)
     MIN_LIQUIDITY = 1000        # FIX #11: minimum LP tokens for initial deposit
     PAUSED = False              # FIX #10: emergency pause state

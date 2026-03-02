@@ -37,7 +37,7 @@ class PoolConfig:
     swap_fee_bps: int = 30           # 0.30% swap fee (default Uniswap-style)
     protocol_fee_bps: int = 5        # 0.05% protocol fee (from swap fee)
     liquidity_fee_bps: int = 10      # 0.10% add/remove liquidity fee
-    max_price_impact_bps: int = 300  # 3% max price impact per swap
+    max_price_impact_bps: int = 1500  # 15% max price impact per swap
     max_swap_ratio_bps: int = 5000   # 50% max single-swap pool drain
     min_initial_liquidity: int = 1000  # min LP tokens for first deposit
     challenge_period_blocks: int = 144  # ~1 day on mainnet
