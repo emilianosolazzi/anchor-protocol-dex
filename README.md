@@ -1,6 +1,7 @@
 # ANCHOR Protocol DEX
 
 Fully on-chain Bitcoin DEX simulation with real cryptographic primitives, 5 covenant strategies, and the novel **ANCHOR protocol** — a BRC-20 fee-market minting mechanism powered by ephemeral anchors.
+By Emiliano Solazzi 2026
 
 ```
 python -m py demo          # run all tests (R-1 → R-8)
