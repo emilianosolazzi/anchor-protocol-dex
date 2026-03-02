@@ -20,6 +20,7 @@ A working simulation of a Bitcoin-native decentralized exchange that uses:
 - **Real HTLC scripts** (OP_IF / OP_SHA256 / OP_CHECKLOCKTIMEVERIFY)
 - **5 covenant mechanisms** with automatic network-aware selection
 - **ANCHOR protocol** — a novel token minting scheme where ANCH tokens are earned by proving you created ephemeral anchor outputs in TRUC (v3) transactions
+- **Production-grade hardening** — overflow guards, anti-replay, DoS caps, frozen proofs, rate-limited API
 
 No real funds are involved. All keys, addresses, and transactions target `regtest`.
 
@@ -30,22 +31,26 @@ No real funds are involved. All keys, addresses, and transactions target `regtes
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Layer 4 — ANCHOR Protocol                                   │
-│    Proof-of-Anchor minting · SlotAuction fee-market          │
-│    BRC-20 inscriptions · TRUC v3 ephemeral anchors           │
+│    Proof-of-Anchor minting (21M, halving, per-creator caps)  │
+│    SlotAuction (English, Dutch, sealed-bid, anti-sniping)    │
+│    BRC-20 inscriptions (deploy/mint/burn/delegate)           │
+│    TRUC v3 ephemeral anchors · frozen AnchorProof            │
 ├──────────────────────────────────────────────────────────────┤
 │  Layer 3 — Covenant AMM                                      │
 │    Constant-product x·y=k · LP ledger · Fraud proofs         │
 │    CTV · CAT · APO · CSFS · Pre-signed trees                │
+│    safe_mul overflow guards · price-impact ceiling            │
 ├──────────────────────────────────────────────────────────────┤
 │  Layer 2 — HTLC + Atomic Swaps                               │
 │    Real HTLC scripts · 2-of-3 multisig · RGB seals           │
+│    Per-sender DoS caps · timelock/hashlock validation         │
 ├──────────────────────────────────────────────────────────────┤
 │  Layer 1 — Real Bitcoin Crypto                               │
-│    secp256k1 · P2WSH · OP_RETURN · DER sigs · regtest        │
+│    secp256k1 · P2WSH · P2WPKH · OP_RETURN · DER sigs        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-See [py/ARCHITECTURE.md](py/ARCHITECTURE.md) for the full package map and import hierarchy.
+See [py/ARCHITECTURE.md](py/ARCHITECTURE.md) for the full package map, import hierarchy, and design decisions.
 
 ---
 
@@ -67,7 +72,7 @@ py/
 ├── covenants/      opcodes.py · ctv.py · cat.py · apo.py · csfs.py · presigned.py · engine.py
 ├── amm/            math.py · state.py · covenant_amm.py · pool.py · dex.py · oracle.py
 ├── anchor/         truc.py · verifier.py · brc20.py · rgb.py · htlc.py · auction.py · minter.py · protocol.py
-├── api/            flask_app.py
+├── api/            flask_app.py (19 endpoints, rate-limit, CORS, request-ID)
 ├── demo.py         Full test suite (R-1 → R-8)
 ├── quickstart.py   100-line fund → swap → withdraw
 ├── production.py   4-layer ProductionDEX wrapper
@@ -84,16 +89,24 @@ The novel contribution: **Proof-of-Anchor minting**.
 
 1. A user creates a **TRUC (v3) transaction** with an **OP_TRUE ephemeral anchor** output
 2. A child transaction spends that anchor (CPFP fee-bumping)
-3. The user submits both transactions as an `AnchorProof` to the protocol
-4. `AnchorVerifier` validates: TRUC version 3, OP_TRUE anchor present, child spends anchor, creator signature, no replay
-5. `ProofOfAnchorMinter` rewards **ANCH tokens** (21M max supply, halving every 5,250 proofs)
-6. `SlotAuction` creates a fee-market where users bid ANCH for the right to anchor in specific block ranges
+3. The user submits both transactions as an `AnchorProof` (immutable, frozen dataclass) to the protocol
+4. `AnchorVerifier` validates: TRUC v3 parent **and** child, OP_TRUE anchor present, exactly one anchor output, child spends anchor, creator signature, no replay (3-index anti-replay registry)
+5. `ProofOfAnchorMinter` rewards **ANCH tokens** (21M max supply, halving every 5,250 proofs, per-creator cap, configurable cooldown)
+6. `SlotAuction` creates a fee-market where users bid ANCH for the right to anchor in specific block ranges (English, Dutch, or sealed-bid auctions with anti-sniping and anti-griefing)
 
 ```
 Submit TRUC v3 parent+child  →  Verify anchor proof  →  Mint ANCH reward
                                                       →  Bid on SlotAuction
                                                       →  Win slot → Prove anchor → Bonus reward
 ```
+
+### BRC-20 Token
+
+The ANCH token is inscribed as a BRC-20 with full spec compliance:
+
+- 4-byte tick validation, stringified amounts
+- Operations: `deploy`, `mint`, `transfer`, `proof`, `bid`, `claim`, `burn`, `delegate`
+- Content hash deduplication via `inscription_content_id()`
 
 ---
 
@@ -113,7 +126,9 @@ The hybrid engine auto-selects the best available mechanism per network:
 
 ## Security
 
-7 security fixes + adversarial hardening, all verified by the R-8 test battery:
+7 core security fixes + protocol-layer hardening across all 4 layers, verified by the R-8 test battery:
+
+### Core Fixes
 
 | Fix | Threat | Protection |
 |-----|--------|-----------|
@@ -125,31 +140,58 @@ The hybrid engine auto-selects the best available mechanism per network:
 | #6 | U64 overflow divergence | `safe_mul` guards all multiplications |
 | #7 | Cancel-swap double refund | Idempotent settlement checks |
 
-Additional: HTLC double-settle prevention, RGB single-use seals, pending swap DoS limit (1000), `@non_reentrant` thread safety, Flask input validation, ClaimRegistry anti-replay (3 indexes).
+### Protocol-Layer Hardening
 
-See [py/SECURITY.md](py/SECURITY.md) for details.
+| Layer | Protection |
+|-------|-----------|
+| **AnchorProof** | `@dataclass(frozen=True)` — immutable after creation |
+| **TRUC validation** | Full BIP-431 package checks (parent+child v3, weight, output limits) |
+| **Verifier** | Child v3 check, multi-anchor rejection, per-creator claim cap (100K) |
+| **BRC-20** | 4-byte tick validation, burn/delegate ops, inscription content hash |
+| **RGB asset** | Balance overflow guard (2⁶³−1), supply tracking, history ring buffer |
+| **HTLC** | Amount bounds (1 sat → 21M BTC), timelock range, hashlock regex, per-sender DoS cap |
+| **Minter** | Per-creator minting cap (5M), configurable cooldown, era/halving tracking |
+| **Auction** | Anti-sniping, anti-griefing, reputation tracking, rate limiting |
+| **AMM** | 1500 bps price-impact ceiling, `@non_reentrant` on 7 mutation methods |
+| **API** | Rate limiting (60 req/min), CORS, request-ID, versioned routes, input validation |
+
+See [py/SECURITY.md](py/SECURITY.md) for full details and threat model.
 
 ---
 
 ## API Endpoints
 
-Start with `python -m py serve --port 5000`:
+Start with `python -m py serve --port 5000`. All routes are under `/api/v1`.
+
+### Core
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Liveness check |
-| GET | `/pool` | Pool reserves + LP |
+| GET | `/health` | Liveness check + pool snapshot |
+| GET | `/pool` | Pool reserves + LP info |
+| GET | `/pool/spot-price` | Current spot price (fixed-point) |
+| GET | `/pool/twap` | TWAP oracle price |
+| GET | `/pool/fees` | Cumulative fee breakdown |
+| GET | `/pool/info` | Full pool detail (config, fees, TWAP) |
 | GET | `/quote?direction=BTC_TO_ANCH&amount=1000000` | Swap quote |
 | POST | `/fund` | Fund user `{"user","btc_sats","anch"}` |
 | POST | `/swap` | Execute swap `{"user","direction","amount"}` |
 | GET | `/balances/<user>` | User balances |
-| GET | `/history` | Swap history |
-| POST | `/rgb/save` | Anchor RGB state |
-| GET | `/anchor/stats` | Protocol statistics |
+| GET | `/history?limit=20&offset=0` | Paginated swap history (max 500) |
+| POST | `/rgb/save` | Anchor RGB state commitment |
+| GET | `/dex/summary` | DEX-wide summary (TVL, volume, fees) |
+
+### ANCHOR Protocol
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/anchor/stats` | Protocol statistics (minter, registry, slots) |
 | GET | `/anchor/balance/<user>` | ANCH balance |
-| GET | `/anchor/slots` | Auction slots |
-| POST | `/anchor/slot` | Create slot |
-| POST | `/anchor/bid` | Place bid |
+| GET | `/anchor/slots` | List auction slots |
+| POST | `/anchor/slot` | Create slot `{"block_start","block_end","min_fee_rate"}` |
+| POST | `/anchor/bid` | Place bid `{"slot_id","user","amount"}` |
+
+Direction aliases: `BTC_TO_ANCH` / `BTC` / `B2A`, `ANCH_TO_BTC` / `ANCH` / `A2B`.
 
 ---
 
@@ -159,7 +201,7 @@ Start with `python -m py serve --port 5000`:
 python -m py demo
 ```
 
-Runs scenarios 1–4 (AMM), P-1–P-4 (production), R-1–R-5 (real crypto), R-6a–R-6g (covenants), R-7a–R-7i (ANCHOR protocol), R-8a–R-8j (adversarial hardening). All pass.
+Runs scenarios 1–4 (AMM + price-impact), P-1–P-4 (production + oracle guard), R-1–R-5 (real crypto), R-6a–R-6g (covenants), R-7a–R-7i (ANCHOR protocol), R-8a–R-8j (adversarial hardening). All pass.
 
 ---
 
@@ -177,6 +219,16 @@ dex.complete_swap(swap_id)
 print(dex.get_balances("alice"))
 # {'btc_sats': 15000000, 'anch': 474829}
 ```
+
+---
+
+## Documentation
+
+| File | Contents |
+|------|----------|
+| [py/ARCHITECTURE.md](py/ARCHITECTURE.md) | Package map, import hierarchy, 18 design decisions |
+| [py/SECURITY.md](py/SECURITY.md) | 7 core fixes, protocol hardening, API hardening, threat model (16 threats) |
+| [py/RUNNING.md](py/RUNNING.md) | Install, 3 run modes, 19 API endpoints, regtest details |
 
 ---
 
