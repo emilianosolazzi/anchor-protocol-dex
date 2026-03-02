@@ -14,6 +14,10 @@ Improvements:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import hmac
 from typing import Dict, Optional, Tuple
@@ -68,13 +72,33 @@ class BitcoinKeyStore:
         This is suitable for testing/simulation ONLY.
       - For production, import keys from external entropy sources
         via import_key().
+      - A runtime guard prevents deterministic key generation when
+        the network is set to mainnet.
     """
 
-    def __init__(self):
+    # Allowed networks for deterministic (insecure) key derivation.
+    _SAFE_NETWORKS = frozenset({"regtest", "testnet", "signet", "inquisition_signet"})
+
+    def __init__(self, network: str = "regtest"):
         self._keys: Dict[str, PrivateKey] = {}
+        self._network: str = network
+
+    def set_network(self, network: str) -> None:
+        """
+        Set the active network.  Deterministic key derivation is
+        blocked on mainnet / liquid to prevent trivially-recoverable
+        keys from being used with real funds.
+        """
+        self._network = network
 
     def _ensure(self, alias: str):
         if alias not in self._keys:
+            if self._network not in self._SAFE_NETWORKS:
+                raise RuntimeError(
+                    f"Deterministic key derivation is disabled on "
+                    f"'{self._network}'. Use import_key() with "
+                    f"externally-generated entropy for mainnet/liquid."
+                )
             seed = hashlib.sha256(f"anchor_dex_key:{alias}".encode()).digest()
             self._keys[alias] = PrivateKey(seed)
 

@@ -17,6 +17,10 @@ Hardening:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import time
 from typing import Dict, List, Tuple, TYPE_CHECKING
 
@@ -174,12 +178,12 @@ class ProofOfAnchorMinter:
         if len(self._mint_history) > MAX_HISTORY:
             self._mint_history = self._mint_history[-MAX_HISTORY:]
 
-        print(f"  [PoA] Proof {proof.proof_id[:16]}... verified")
-        print(f"         Creator: {proof.creator}")
-        print(f"         Reward:  {reward:,} ANCH "
+        logger.info(f"  [PoA] Proof {proof.proof_id[:16]}... verified")
+        logger.info(f"         Creator: {proof.creator}")
+        logger.info(f"         Reward:  {reward:,} ANCH "
               f"(era {self.current_era}, "
               f"{'GENESIS BONUS' if is_genesis else 'standard'})")
-        print(f"         Minted:  {self.total_minted:,} / {self.MAX_SUPPLY:,} ANCH")
+        logger.info(f"         Minted:  {self.total_minted:,} / {self.MAX_SUPPLY:,} ANCH")
         return True, "minted", reward
 
     def creator_stats(self, creator: str) -> dict:

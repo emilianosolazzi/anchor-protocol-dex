@@ -14,6 +14,10 @@ Hardening:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import json
 import time
@@ -53,7 +57,7 @@ class SingleUseSeal:
 
     def close(self, closing_txid: str) -> bool:
         if self.closed:
-            print(f"  [RGB] Double-spend attempt on seal {self.seal_id[:12]}... "
+            logger.info(f"  [RGB] Double-spend attempt on seal {self.seal_id[:12]}... "
                   f"(already closed by {self.seal_txid[:12]}...)")
             return False
         if not closing_txid:
@@ -208,7 +212,7 @@ class RGBAsset:
             "total_supply": self._total_supply,
             "ts": time.time(), "seq": self._issue_seq,
         })
-        print(f"  [RGB] Minted {amount:,} {self.ticker} to {to_addr[:12]}...")
+        logger.info(f"  [RGB] Minted {amount:,} {self.ticker} to {to_addr[:12]}...")
 
     def balance_of(self, addr: str) -> int:
         return self.balances.get(addr, 0)
@@ -239,9 +243,9 @@ class RGBAsset:
             "total_supply": self._total_supply,
             "ts": time.time(),
         })
-        print(f"  [RGB] State commitment anchored: {commitment.hex()[:32]}...")
-        print(f"         OP_RETURN TXID: {op_return_txid}")
-        print(f"         OP_RETURN TX:   {op_return_hex[:80]}...")
+        logger.info(f"  [RGB] State commitment anchored: {commitment.hex()[:32]}...")
+        logger.info(f"         OP_RETURN TXID: {op_return_txid}")
+        logger.info(f"         OP_RETURN TX:   {op_return_hex[:80]}...")
         return commitment
 
     def create_transfer(
@@ -296,7 +300,7 @@ class RGBAsset:
             "from": from_addr, "to": to_addr, "amount": amount,
             "seal": outpoint[:20], "ts": time.time(),
         })
-        print(f"  [RGB] Pending transfer {transfer_id[:16]}... "
+        logger.info(f"  [RGB] Pending transfer {transfer_id[:16]}... "
               f"{amount:,} {self.ticker} {from_addr[:12]}... -> {to_addr[:12]}... "
               f"[seal: {outpoint[:20]}...]")
         return t
@@ -309,16 +313,16 @@ class RGBAsset:
         """
         t = self.transfers.get(transfer_id)
         if t is None:
-            print(f"  [RGB] Unknown transfer {transfer_id[:16]}...")
+            logger.info(f"  [RGB] Unknown transfer {transfer_id[:16]}...")
             return False
         if t.finalized:
-            print(f"  [RGB] Transfer {transfer_id[:16]}... already settled")
+            logger.info(f"  [RGB] Transfer {transfer_id[:16]}... already settled")
             return False
         if t.reveal(secret):
             new_balance = self.balances.get(t.to_addr, 0) + t.amount
             if new_balance > MAX_BALANCE:
                 # Should never happen in practice, but guard anyway
-                print(f"  [RGB] Settlement would exceed balance ceiling")
+                logger.info(f"  [RGB] Settlement would exceed balance ceiling")
                 return False
             self.balances[t.to_addr] = new_balance
             del self.transfers[transfer_id]
@@ -327,11 +331,11 @@ class RGBAsset:
                 "to": t.to_addr, "amount": t.amount, "ts": time.time(),
             })
             seal_info = t.seal.seal_txid[:16] if t.seal and t.seal.seal_txid else 'n/a'
-            print(f"  [RGB] Transfer {transfer_id[:16]}... settled "
+            logger.info(f"  [RGB] Transfer {transfer_id[:16]}... settled "
                   f"({t.amount:,} {self.ticker} -> {t.to_addr[:12]}...) "
                   f"[seal closed: {seal_info}...]")
             return True
-        print(f"  [RGB] Wrong secret for transfer {transfer_id[:16]}...")
+        logger.info(f"  [RGB] Wrong secret for transfer {transfer_id[:16]}...")
         return False
 
     def refund_transfer(self, transfer_id: str) -> bool:
@@ -351,7 +355,7 @@ class RGBAsset:
             "type": "transfer_refunded", "id": transfer_id[:16],
             "from": t.from_addr, "amount": t.amount, "ts": time.time(),
         })
-        print(f"  [RGB] Transfer {transfer_id[:16]}... refunded to {t.from_addr[:12]}...")
+        logger.info(f"  [RGB] Transfer {transfer_id[:16]}... refunded to {t.from_addr[:12]}...")
         return True
 
     def get_history(self, *, limit: int = 100) -> List[dict]:

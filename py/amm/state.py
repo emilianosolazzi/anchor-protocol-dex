@@ -207,7 +207,10 @@ class TWAPSnapshot:
         if dt <= 0:
             return None
         delta = snap_new.cumulative_price_btc - snap_old.cumulative_price_btc
-        return int(delta / dt)
+        # Integer division only — no floats on consensus path.
+        # Truncating sub-second dt is acceptable for TWAP precision.
+        dt_int = max(1, int(dt))
+        return delta // dt_int
 
 
 # ---------------------------------------------------------------------------

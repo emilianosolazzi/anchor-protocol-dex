@@ -15,6 +15,10 @@ Improvements:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import time
 from typing import Dict, List, Optional, Tuple
@@ -132,7 +136,7 @@ class OnChainPool:
     def _slash_bond(self, from_addr: str, to_addr: str, amount: int):
         self._bonds[from_addr] = max(0, self._bonds.get(from_addr, 0) - amount)
         self._bonds[to_addr] = self._bonds.get(to_addr, 0) + amount
-        print(f"  [BOND] Slashed {amount:,} sats from {from_addr[:12]}... "
+        logger.info(f"  [BOND] Slashed {amount:,} sats from {from_addr[:12]}... "
               f"-> rewarded {to_addr[:12]}...")
 
     # -- TWAP and event tracking --
@@ -210,7 +214,7 @@ class OnChainPool:
         min_amount_out: int = 0,
     ) -> Optional[str]:
         if len(self.pending_swaps) >= self.MAX_PENDING_SWAPS:
-            print(f"  [POOL] Too many pending swaps ({self.MAX_PENDING_SWAPS}); "
+            logger.info(f"  [POOL] Too many pending swaps ({self.MAX_PENDING_SWAPS}); "
                   f"rejecting proposal")
             return None
 
@@ -232,7 +236,7 @@ class OnChainPool:
         if not CovenantAMMScript.execute_covenant(
             self.state, new_state, witness, prev_seq=self._seq
         ):
-            print("  Swap rejected by covenant (invariant, slippage, or price impact)")
+            logger.info("  Swap rejected by covenant (invariant, slippage, or price impact)")
             return None
 
         covenant_result = self.covenant_engine.enforce_swap(
@@ -240,11 +244,11 @@ class OnChainPool:
         )
         strategy = covenant_result.get("strategy", "unknown")
         mechanism = covenant_result.get("mechanism", "")
-        print(f"  [HYBRID COVENANT] Strategy: {strategy}")
-        print(f"  [HYBRID COVENANT] {mechanism}")
+        logger.info(f"  [HYBRID COVENANT] Strategy: {strategy}")
+        logger.info(f"  [HYBRID COVENANT] {mechanism}")
         if "template_hash" in covenant_result:
-            print(f"  [HYBRID COVENANT] CTV hash: {covenant_result['template_hash'][:32]}...")
-        print(f"  [HYBRID COVENANT] State: {covenant_result['old_state_hash'][:16]}... "
+            logger.info(f"  [HYBRID COVENANT] CTV hash: {covenant_result['template_hash'][:32]}...")
+        logger.info(f"  [HYBRID COVENANT] State: {covenant_result['old_state_hash'][:16]}... "
               f"-> {covenant_result['new_state_hash'][:16]}...")
 
         txid = hashlib.sha256(
@@ -262,7 +266,7 @@ class OnChainPool:
             min_amount_out=min_amount_out,
             old_seq=self._seq,
         )
-        print(f"  Swap proposal {txid[:16]}... submitted (seq={self._seq}). "
+        logger.info(f"  Swap proposal {txid[:16]}... submitted (seq={self._seq}). "
               f"Challenge window: {self.challenge_period} blocks.")
         return txid
 
@@ -273,18 +277,18 @@ class OnChainPool:
         fraud_proof: FraudProof,
     ) -> bool:
         if txid not in self.pending_swaps:
-            print("  No such pending swap")
+            logger.info("  No such pending swap")
             return False
 
         pending = self.pending_swaps[txid]
         blocks_elapsed = self._current_block() - self._proposal_block(pending.timestamp)
         if blocks_elapsed > self.challenge_period:
-            print("  Challenge period expired -- swap can be finalised")
+            logger.info("  Challenge period expired -- swap can be finalised")
             return False
 
         challenge_age = self._current_block() - self._proposal_block(fraud_proof.submitted_at)
         if challenge_age > fraud_proof.RESPONSE_WINDOW:
-            print(f"  Challenger {challenger[:12]}... exceeded response window "
+            logger.info(f"  Challenger {challenger[:12]}... exceeded response window "
                   f"({challenge_age} > {fraud_proof.RESPONSE_WINDOW} blocks) -- ignored")
             return False
 
@@ -293,6 +297,7 @@ class OnChainPool:
 
         old = pending.old_state
         new = pending.new_state
+        fb = self.config.swap_fee_bps // 10  # bps -> per-mille
 
         if pending.swap_type == SwapType.BTC_TO_ANCH:
             btc_in = new.btc_reserve - old.btc_reserve
@@ -302,6 +307,7 @@ class OnChainPool:
                 new.btc_reserve, new.anch_reserve,
                 btc_in=btc_in, anch_out=anch_out,
                 min_amount_out=pending.min_amount_out,
+                fee_basis=fb,
             )
         else:
             anch_in = new.anch_reserve - old.anch_reserve
@@ -311,20 +317,21 @@ class OnChainPool:
                 new.btc_reserve, new.anch_reserve,
                 anch_in=anch_in, btc_out=btc_out,
                 min_amount_out=pending.min_amount_out,
+                fee_basis=fb,
             )
 
         if not valid:
             self._release_bond(challenger, fraud_proof.bond)
             reward = fraud_proof.bond // 2
             self._bonds[challenger] = self._bonds.get(challenger, 0) + reward
-            print(f"  Challenge by {challenger[:12]}... succeeded! "
+            logger.info(f"  Challenge by {challenger[:12]}... succeeded! "
                   f"Swap {txid[:16]}... removed. "
                   f"Reward: +{reward:,} sats (from proposer penalty).")
             del self.pending_swaps[txid]
             return True
         else:
             self._slash_bond(challenger, "POOL_PENALTY_RESERVE", fraud_proof.bond)
-            print(f"  Challenge by {challenger[:12]}... failed -- swap is valid. "
+            logger.info(f"  Challenge by {challenger[:12]}... failed -- swap is valid. "
                   f"Bond of {fraud_proof.bond:,} sats slashed.")
             return False
 
@@ -336,13 +343,13 @@ class OnChainPool:
         the check passes immediately.  This is intentional.
         """
         if txid not in self.pending_swaps:
-            print("  No such pending swap (may have been challenged already)")
+            logger.info("  No such pending swap (may have been challenged already)")
             return None
 
         pending = self.pending_swaps[txid]
         blocks_elapsed = self._current_block() - self._proposal_block(pending.timestamp)
         if blocks_elapsed < self.challenge_period:
-            print(f"  Challenge period not yet over "
+            logger.info(f"  Challenge period not yet over "
                   f"({blocks_elapsed}/{self.challenge_period} blocks elapsed)")
             return None
 
@@ -354,7 +361,7 @@ class OnChainPool:
         self._emit_event("swap_finalized", txid=txid,
                          btc_reserve=self.state.btc_reserve,
                          anch_reserve=self.state.anch_reserve)
-        print(f"  Swap {txid[:16]}... finalised (seq->{self._seq}). "
+        logger.info(f"  Swap {txid[:16]}... finalised (seq->{self._seq}). "
               f"New reserves -> BTC={self.state.btc_reserve:,} "
               f"ANCH={self.state.anch_reserve:,}")
         return self.state
@@ -368,7 +375,7 @@ class OnChainPool:
         signature: bytes,
     ) -> Optional[str]:
         if len(self.pending_liquidity) >= self.MAX_PENDING_LIQUIDITY:
-            print(f"  [POOL] Too many pending liquidity changes "
+            logger.info(f"  [POOL] Too many pending liquidity changes "
                   f"({self.MAX_PENDING_LIQUIDITY}); rejecting")
             return None
 
@@ -387,7 +394,7 @@ class OnChainPool:
                 btc_amount, anch_amount, lp_minted,
             )
             if not valid:
-                print("  ADD_LIQUIDITY violates pool invariant -- rejected")
+                logger.info("  ADD_LIQUIDITY violates pool invariant -- rejected")
                 return None
             lc = LiquidityChange(
                 user=user, liq_type=liq_type,
@@ -398,7 +405,7 @@ class OnChainPool:
         else:  # REMOVE
             lp_burned = btc_amount
             if lp_burned <= 0 or lp_burned > old.lp_total:
-                print("  REMOVE_LIQUIDITY: invalid LP burn amount")
+                logger.info("  REMOVE_LIQUIDITY: invalid LP burn amount")
                 return None
             btc_out, anch_out = CovenantAMMScript.compute_remove_amounts(
                 lp_burned, old.btc_reserve, old.anch_reserve, old.lp_total,
@@ -412,7 +419,7 @@ class OnChainPool:
                 btc_out, anch_out, lp_burned,
             )
             if not valid:
-                print("  REMOVE_LIQUIDITY violates pool invariant -- rejected")
+                logger.info("  REMOVE_LIQUIDITY violates pool invariant -- rejected")
                 return None
             lc = LiquidityChange(
                 user=user, liq_type=liq_type,
@@ -426,18 +433,18 @@ class OnChainPool:
             f"{user}{liq_type.name}{btc_amount}{anch_amount}{time.time()}".encode()
         ).hexdigest()
         self.pending_liquidity[txid] = lc
-        print(f"  Liquidity proposal {txid[:16]}... submitted: {label}")
-        print(f"  Challenge window: {self.challenge_period} blocks.")
+        logger.info(f"  Liquidity proposal {txid[:16]}... submitted: {label}")
+        logger.info(f"  Challenge window: {self.challenge_period} blocks.")
         return txid
 
     def challenge_liquidity(self, txid: str, challenger: str) -> bool:
         if txid not in self.pending_liquidity:
-            print("  No such pending liquidity change")
+            logger.info("  No such pending liquidity change")
             return False
         lc = self.pending_liquidity[txid]
         blocks_elapsed = self._current_block() - self._proposal_block(lc.timestamp)
         if blocks_elapsed > self.challenge_period:
-            print("  Challenge period expired -- liquidity change can be finalised")
+            logger.info("  Challenge period expired -- liquidity change can be finalised")
             return False
         old = self.state
         if lc.liq_type == LiquidityType.ADD:
@@ -461,23 +468,23 @@ class OnChainPool:
                 lc.btc_amount, lc.anch_amount, lp_burned,
             )
         if not valid:
-            print(f"  Challenge by {challenger} succeeded! "
+            logger.info(f"  Challenge by {challenger} succeeded! "
                   f"Liquidity proposal {txid[:16]}... was invalid and removed.")
             del self.pending_liquidity[txid]
             return True
         else:
-            print(f"  Challenge by {challenger} failed -- proposal is valid. "
+            logger.info(f"  Challenge by {challenger} failed -- proposal is valid. "
                   f"Challenger would forfeit their bond.")
             return False
 
     def finalize_liquidity(self, txid: str) -> Optional[PoolState]:
         if txid not in self.pending_liquidity:
-            print("  No such pending liquidity change (may already be resolved)")
+            logger.info("  No such pending liquidity change (may already be resolved)")
             return None
         lc = self.pending_liquidity[txid]
         blocks_elapsed = self._current_block() - self._proposal_block(lc.timestamp)
         if blocks_elapsed < self.challenge_period:
-            print(f"  Challenge period not yet over "
+            logger.info(f"  Challenge period not yet over "
                   f"({blocks_elapsed}/{self.challenge_period} blocks elapsed)")
             return None
         old = self.state
@@ -513,8 +520,8 @@ class OnChainPool:
                          action=lc.liq_type.name,
                          btc_reserve=new_btc, anch_reserve=new_anch,
                          lp_total=new_lp)
-        print(f"  Liquidity change {txid[:16]}... finalised ({lc.user} {action}).")
-        print(f"  Reserves -> BTC={new_btc:,} ANCH={new_anch:,} LP={new_lp:,}")
+        logger.info(f"  Liquidity change {txid[:16]}... finalised ({lc.user} {action}).")
+        logger.info(f"  Reserves -> BTC={new_btc:,} ANCH={new_anch:,} LP={new_lp:,}")
         return new_state
 
     def lp_balance_of(self, user: str) -> int:
@@ -549,11 +556,14 @@ class OnChainPool:
         return self.state.btc_reserve * 10**8 // self.state.anch_reserve
 
     def quote(self, swap_type: SwapType, amount_in: int) -> int:
+        fb = self.config.swap_fee_bps // 10  # bps -> per-mille
         if swap_type == SwapType.BTC_TO_ANCH:
             return CovenantAMMScript.get_amount_out(
-                amount_in, self.state.btc_reserve, self.state.anch_reserve
+                amount_in, self.state.btc_reserve, self.state.anch_reserve,
+                fee_basis=fb,
             )
         else:
             return CovenantAMMScript.get_amount_out(
-                amount_in, self.state.anch_reserve, self.state.btc_reserve
+                amount_in, self.state.anch_reserve, self.state.btc_reserve,
+                fee_basis=fb,
             )

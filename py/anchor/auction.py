@@ -36,6 +36,10 @@ Lifecycle: OPEN -> REVEAL -> WON -> CONSUMED | EXPIRED | SLASHED
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import math
 import secrets
@@ -223,12 +227,26 @@ class AuctionConfig:
 # ---------------------------------------------------------------------------
 
 class _RateLimiter:
-    """Per-identity sliding-window rate limiter."""
+    """Per-identity sliding-window rate limiter with LRU eviction."""
+
+    MAX_IDENTITIES = 10_000  # Evict oldest entries beyond this
 
     def __init__(self, max_actions: int, window: float):
         self.max_actions = max_actions
         self.window = window
         self._actions: Dict[str, List[float]] = {}
+
+    def _evict_if_needed(self):
+        """Evict oldest half when capacity exceeded (LRU-style)."""
+        if len(self._actions) > self.MAX_IDENTITIES:
+            # Sort by latest action timestamp; remove oldest half
+            by_latest = sorted(
+                self._actions.items(),
+                key=lambda kv: kv[1][-1] if kv[1] else 0.0,
+            )
+            cutoff = len(by_latest) // 2
+            for identity, _ in by_latest[:cutoff]:
+                del self._actions[identity]
 
     def check(self, identity: str) -> bool:
         now = time.time()
@@ -242,6 +260,7 @@ class _RateLimiter:
         now = time.time()
         history = self._actions.setdefault(identity, [])
         history.append(now)
+        self._evict_if_needed()
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +326,7 @@ class SlotAuction:
             first_seen=time.time(),
             last_activity=time.time(),
         )
-        print(f"  [ID] Registered identity {pubkey[:12]}... "
+        logger.info(f"  [ID] Registered identity {pubkey[:12]}... "
               f"commitment={commitment[:16]}...")
         return True, "registered"
 
@@ -321,7 +340,7 @@ class SlotAuction:
             return False, "referrer not registered"
         self._referrals[referee] = referrer
         self._reputations[referrer].referral_count += 1
-        print(f"  [REF] {referee[:12]}... referred by {referrer[:12]}...")
+        logger.info(f"  [REF] {referee[:12]}... referred by {referrer[:12]}...")
         return True, "referral registered"
 
     def get_reputation(self, identity: str) -> Optional[dict]:
@@ -472,7 +491,7 @@ class SlotAuction:
         extra = ""
         if auction_type == AuctionType.DUTCH:
             extra = f" dutch_start={d_start:,} floor={d_floor:,}"
-        print(f"  [SLOT] Created {auction_type.value} slot {slot_id[:16]}... "
+        logger.info(f"  [SLOT] Created {auction_type.value} slot {slot_id[:16]}... "
               f"blocks {block_start}-{block_end} min_fee={effective_min} sat/vB"
               f"{extra}")
         return slot
@@ -548,7 +567,7 @@ class SlotAuction:
             self.anch.balances[slot.winner] = (
                 self.anch.balances.get(slot.winner, 0) + slot.highest_bid
             )
-            print(f"  [SLOT] Refunded {slot.highest_bid:,} ANCH to "
+            logger.info(f"  [SLOT] Refunded {slot.highest_bid:,} ANCH to "
                   f"{slot.winner[:12]}...")
 
         # Escrow bid + collect bond
@@ -575,11 +594,11 @@ class SlotAuction:
                 old_deadline = slot.deadline
                 slot.deadline += self.config.extension_duration
                 slot.extension_count += 1
-                print(f"  [SNIPE] Deadline extended by "
+                logger.info(f"  [SNIPE] Deadline extended by "
                       f"{self.config.extension_duration:.0f}s "
                       f"(extension {slot.extension_count}/{slot.max_extensions})")
 
-        print(f"  [SLOT] Bid {anch_amount:,} ANCH (bond={bond:,}) by "
+        logger.info(f"  [SLOT] Bid {anch_amount:,} ANCH (bond={bond:,}) by "
               f"{bidder[:12]}... on slot {slot.slot_id[:16]}...")
         return True, "bid accepted"
 
@@ -647,7 +666,7 @@ class SlotAuction:
         self._update_reputation_bid(bidder)
         self._update_reputation_win(bidder)
 
-        print(f"  [DUTCH] {bidder[:12]}... claimed slot {slot.slot_id[:16]}... "
+        logger.info(f"  [DUTCH] {bidder[:12]}... claimed slot {slot.slot_id[:16]}... "
               f"at {anch_amount:,} ANCH (Dutch price={current_price:,})")
         return True, "dutch claim accepted -- slot WON"
 
@@ -709,7 +728,7 @@ class SlotAuction:
         self._rate_limiter.record(bidder)
         self._update_reputation_bid(bidder)
 
-        print(f"  [SEALED] Commitment from {bidder[:12]}... "
+        logger.info(f"  [SEALED] Commitment from {bidder[:12]}... "
               f"bond={bond_amount:,} ANCH on slot {slot.slot_id[:16]}...")
         return True, "commitment accepted"
 
@@ -729,7 +748,7 @@ class SlotAuction:
 
         slot.state = SlotState.REVEAL
         slot.reveal_deadline = time.time() + self.config.reveal_phase_seconds
-        print(f"  [SEALED] Reveal phase started for slot {slot.slot_id[:16]}...")
+        logger.info(f"  [SEALED] Reveal phase started for slot {slot.slot_id[:16]}...")
         return True, "reveal phase started"
 
     def reveal_bid(
@@ -779,7 +798,7 @@ class SlotAuction:
         elif amount > slot.second_bid:
             slot.second_bid = amount
 
-        print(f"  [SEALED] Reveal: {bidder[:12]}... bid {amount:,} ANCH")
+        logger.info(f"  [SEALED] Reveal: {bidder[:12]}... bid {amount:,} ANCH")
         return True, "bid revealed"
 
     def finalize_sealed(self, slot_id: str) -> Tuple[bool, str]:
@@ -797,7 +816,7 @@ class SlotAuction:
         # Vickrey: winner pays second-highest price
         if slot.auction_type == AuctionType.VICKREY:
             pay = slot.second_bid if slot.second_bid > 0 else slot.highest_bid
-            print(f"  [VICKREY] Winner pays second-price: {pay:,} ANCH "
+            logger.info(f"  [VICKREY] Winner pays second-price: {pay:,} ANCH "
                   f"(bid was {slot.highest_bid:,})")
             # Refund the difference
             refund_diff = slot.highest_bid - pay
@@ -807,7 +826,15 @@ class SlotAuction:
                 )
             slot.highest_bid = pay
 
-        # Escrow the winning amount
+        # Escrow the winning amount (with balance check)
+        winner_balance = self.anch.balance_of(slot.winner)
+        if winner_balance < slot.highest_bid:
+            slot.state = SlotState.EXPIRED
+            self._completed_slots.append(slot)
+            logger.info(f"  [SEALED] Winner {slot.winner[:12]}... has insufficient "
+                  f"balance ({winner_balance:,} < {slot.highest_bid:,})")
+            return False, "winner has insufficient balance"
+
         self.anch.balances[slot.winner] = (
             self.anch.balances.get(slot.winner, 0) - slot.highest_bid
         )
@@ -822,9 +849,9 @@ class SlotAuction:
                 self.anch.balances[bid.bidder] = (
                     self.anch.balances.get(bid.bidder, 0) + bid.bond
                 )
-                print(f"  [SEALED] Bond refunded to {bid.bidder[:12]}...")
+                logger.info(f"  [SEALED] Bond refunded to {bid.bidder[:12]}...")
 
-        print(f"  [SLOT] {slot.auction_type.value} slot {slot.slot_id[:16]}... "
+        logger.info(f"  [SLOT] {slot.auction_type.value} slot {slot.slot_id[:16]}... "
               f"won by {slot.winner[:12]}... for {slot.highest_bid:,} ANCH")
         return True, "finalized"
 
@@ -873,7 +900,7 @@ class SlotAuction:
         self._rate_limiter.record(bidder)
         self._update_reputation_bid(bidder)
 
-        print(f"  [BATCH] Bid {anch_amount:,} ANCH by {bidder[:12]}...")
+        logger.info(f"  [BATCH] Bid {anch_amount:,} ANCH by {bidder[:12]}...")
         return True, "batch bid accepted"
 
     def clear_batch(self, slot_id: str) -> Tuple[bool, str, int]:
@@ -915,7 +942,7 @@ class SlotAuction:
             self.anch.balances[bid.bidder] = (
                 self.anch.balances.get(bid.bidder, 0) + bid.amount
             )
-            print(f"  [BATCH] Refunded {bid.amount:,} ANCH to {bid.bidder[:12]}...")
+            logger.info(f"  [BATCH] Refunded {bid.amount:,} ANCH to {bid.bidder[:12]}...")
 
         # Refund winner the difference between their bid and clearing price
         refund = winner_bid.amount - clearing_price
@@ -923,9 +950,9 @@ class SlotAuction:
             self.anch.balances[slot.winner] = (
                 self.anch.balances.get(slot.winner, 0) + refund
             )
-            print(f"  [BATCH] Winner overpay refund: {refund:,} ANCH")
+            logger.info(f"  [BATCH] Winner overpay refund: {refund:,} ANCH")
 
-        print(f"  [BATCH] Cleared at {clearing_price:,} ANCH, "
+        logger.info(f"  [BATCH] Cleared at {clearing_price:,} ANCH, "
               f"winner={slot.winner[:12]}...")
         return True, "batch cleared", clearing_price
 
@@ -962,20 +989,20 @@ class SlotAuction:
                         )
                     slot.winner = best.bidder
                     slot.highest_bid = best.amount
-                    print(f"  [CANDLE] Retroactive cutoff at "
+                    logger.info(f"  [CANDLE] Retroactive cutoff at "
                           f"{candle_cutoff:.0f}, winner={best.bidder[:12]}... "
                           f"bid={best.amount:,}")
 
         if slot.winner is None:
             slot.state = SlotState.EXPIRED
             self._completed_slots.append(slot)
-            print(f"  [SLOT] Slot {slot.slot_id[:16]}... expired (no bids)")
+            logger.info(f"  [SLOT] Slot {slot.slot_id[:16]}... expired (no bids)")
             return True, "expired (no bids)"
 
         slot.state = SlotState.WON
         slot.consume_deadline = time.time() + self.config.consume_deadline_seconds
         self._update_reputation_win(slot.winner)
-        print(f"  [SLOT] Slot {slot.slot_id[:16]}... won by "
+        logger.info(f"  [SLOT] Slot {slot.slot_id[:16]}... won by "
               f"{slot.winner[:12]}... for {slot.highest_bid:,} ANCH")
         return True, "closed"
 
@@ -1061,15 +1088,15 @@ class SlotAuction:
         self._completed_slots.append(slot)
         self._update_reputation_consume(slot.winner)
 
-        print(f"  [SLOT] Slot {slot.slot_id[:16]}... consumed by "
+        logger.info(f"  [SLOT] Slot {slot.slot_id[:16]}... consumed by "
               f"{slot.winner[:12]}...")
-        print(f"         Refund: {slot.highest_bid:,} - fee {protocol_fee:,} "
+        logger.info(f"         Refund: {slot.highest_bid:,} - fee {protocol_fee:,} "
               f"+ reward {base_reward:,} + loyalty {loyalty_bonus:,} "
               f"= {refund:,} ANCH")
         if referral_reward:
-            print(f"         Referral reward: {referral_reward:,} ANCH "
+            logger.info(f"         Referral reward: {referral_reward:,} ANCH "
                   f"to {referrer[:12]}...")
-        print(f"         Protocol: {treasury_share:,} treasury + "
+        logger.info(f"         Protocol: {treasury_share:,} treasury + "
               f"{lp_share:,} LP pool")
         return True, "consumed"
 
@@ -1117,11 +1144,11 @@ class SlotAuction:
         if slot.winner:
             self._update_reputation_expire(slot.winner, slash_amount)
 
-        print(f"  [SLOT] Slot {slot.slot_id[:16]}... {slot.state.value}. "
+        logger.info(f"  [SLOT] Slot {slot.slot_id[:16]}... {slot.state.value}. "
               f"Slashed {slash_amount:,} ANCH ({slash_bps/100:.0f}%), "
               f"refunded {refund_amount:,} ANCH.")
         if rep:
-            print(f"         {slot.winner[:12]}... reputation: "
+            logger.info(f"         {slot.winner[:12]}... reputation: "
                   f"{rep.reputation_score}/1000 "
                   f"(tier {rep.loyalty_tier})")
         return True, slot.state.value

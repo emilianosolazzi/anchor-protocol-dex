@@ -8,6 +8,10 @@ ProductionDEX -- four-layer production-grade DEX.
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import os
 import time
@@ -54,16 +58,16 @@ class ProductionDEX:
         btc_amount: int,
         slippage_bps: int = 50,
     ) -> Tuple[str, HTLCContract, RGBTransfer]:
-        print(f"\n  [ProductionDEX] {user[:12]}... wants to swap {btc_amount:,} sats -> ANCH")
+        logger.info(f"\n  [ProductionDEX] {user[:12]}... wants to swap {btc_amount:,} sats -> ANCH")
 
         anch_amount = self.liquidity_pool.get_quote(SwapType.BTC_TO_ANCH, btc_amount)
-        print(f"  [ProductionDEX] AMM quote: {btc_amount:,} sats -> {anch_amount:,} ANCH")
+        logger.info(f"  [ProductionDEX] AMM quote: {btc_amount:,} sats -> {anch_amount:,} ANCH")
 
         if not self.oracle.check_price_integer(btc_amount, anch_amount):
             raise ValueError("[ProductionDEX] Oracle price check failed -- swap aborted")
 
         min_out = anch_amount * (10_000 - slippage_bps) // 10_000
-        print(f"  [ProductionDEX] min_amount_out={min_out:,} ANCH "
+        logger.info(f"  [ProductionDEX] min_amount_out={min_out:,} ANCH "
               f"(slippage tolerance: {slippage_bps/100:.2f}%)")
 
         secret = os.urandom(32)
@@ -94,7 +98,7 @@ class ProductionDEX:
             "rgb_transfer": anch_transfer,
             "created_at": time.time(),
         }
-        print(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
+        logger.info(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
               f"Call complete_swap() to reveal secret and settle.")
         return swap_id, btc_htlc, anch_transfer
 
@@ -104,16 +108,16 @@ class ProductionDEX:
         anch_amount: int,
         slippage_bps: int = 50,
     ) -> Tuple[str, RGBTransfer, HTLCContract]:
-        print(f"\n  [ProductionDEX] {user[:12]}... wants to swap {anch_amount:,} ANCH -> BTC")
+        logger.info(f"\n  [ProductionDEX] {user[:12]}... wants to swap {anch_amount:,} ANCH -> BTC")
 
         btc_amount = self.liquidity_pool.get_quote(SwapType.ANCH_TO_BTC, anch_amount)
-        print(f"  [ProductionDEX] AMM quote: {anch_amount:,} ANCH -> {btc_amount:,} sats")
+        logger.info(f"  [ProductionDEX] AMM quote: {anch_amount:,} ANCH -> {btc_amount:,} sats")
 
         if not self.oracle.check_price_integer(btc_amount, anch_amount):
             raise ValueError("[ProductionDEX] Oracle price check failed -- swap aborted")
 
         min_out = btc_amount * (10_000 - slippage_bps) // 10_000
-        print(f"  [ProductionDEX] min_amount_out={min_out:,} sats "
+        logger.info(f"  [ProductionDEX] min_amount_out={min_out:,} sats "
               f"(slippage tolerance: {slippage_bps/100:.2f}%)")
 
         secret = os.urandom(32)
@@ -144,14 +148,14 @@ class ProductionDEX:
             "rgb_transfer": anch_transfer,
             "created_at": time.time(),
         }
-        print(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
+        logger.info(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
               f"Call complete_swap() to reveal secret and settle.")
         return swap_id, anch_transfer, btc_htlc
 
     def complete_swap(self, swap_id: str) -> bool:
         entry = self._pending.get(swap_id)
         if entry is None:
-            print(f"  [ProductionDEX] Unknown swap {swap_id[:16]}...")
+            logger.info(f"  [ProductionDEX] Unknown swap {swap_id[:16]}...")
             return False
 
         secret = entry["secret"]
@@ -159,17 +163,17 @@ class ProductionDEX:
         htlc = entry["htlc"]
         rgb = entry["rgb_transfer"]
 
-        print(f"\n  [ProductionDEX] Completing swap {swap_id[:16]}... "
+        logger.info(f"\n  [ProductionDEX] Completing swap {swap_id[:16]}... "
               f"(revealing secret)")
 
         min_out = entry.get("min_out", 0)
 
         if direction == SwapType.BTC_TO_ANCH:
             if not self.htlc_engine.settle_htlc(htlc.contract_id, secret):
-                print("  [ProductionDEX] HTLC settlement failed")
+                logger.info("  [ProductionDEX] HTLC settlement failed")
                 return False
             if not self.anch_rgb.settle_transfer(rgb.transfer_id, secret):
-                print("  [ProductionDEX] RGB settlement failed")
+                logger.info("  [ProductionDEX] RGB settlement failed")
                 return False
             ok = self.liquidity_pool.apply_swap(
                 SwapType.BTC_TO_ANCH, entry["btc_amount"], entry["anch_amount"],
@@ -177,10 +181,10 @@ class ProductionDEX:
             )
         else:
             if not self.htlc_engine.settle_htlc(htlc.contract_id, secret):
-                print("  [ProductionDEX] HTLC settlement failed")
+                logger.info("  [ProductionDEX] HTLC settlement failed")
                 return False
             if not self.anch_rgb.settle_transfer(rgb.transfer_id, secret):
-                print("  [ProductionDEX] RGB settlement failed")
+                logger.info("  [ProductionDEX] RGB settlement failed")
                 return False
             ok = self.liquidity_pool.apply_swap(
                 SwapType.ANCH_TO_BTC, entry["anch_amount"], entry["btc_amount"],
@@ -189,9 +193,9 @@ class ProductionDEX:
 
         if ok:
             del self._pending[swap_id]
-            print(f"  [ProductionDEX] Swap {swap_id[:16]}... complete")
+            logger.info(f"  [ProductionDEX] Swap {swap_id[:16]}... complete")
         else:
-            print(f"  [ProductionDEX] BitVM pool update failed")
+            logger.info(f"  [ProductionDEX] BitVM pool update failed")
         return ok
 
     def cancel_swap(self, swap_id: str, current_block: int) -> bool:
@@ -206,12 +210,12 @@ class ProductionDEX:
 
         if btc_refunded and anch_refunded:
             del self._pending[swap_id]
-            print(f"  [ProductionDEX] Swap {swap_id[:16]}... cancelled and refunded.")
+            logger.info(f"  [ProductionDEX] Swap {swap_id[:16]}... cancelled and refunded.")
             return True
         elif btc_refunded or anch_refunded:
             leg_ok = "BTC" if btc_refunded else "ANCH"
             leg_fail = "ANCH" if btc_refunded else "BTC"
-            print(f"  [ProductionDEX] Partial cancel {swap_id[:16]}...: "
+            logger.info(f"  [ProductionDEX] Partial cancel {swap_id[:16]}...: "
                   f"{leg_ok} refunded, {leg_fail} was already settled/refunded")
             del self._pending[swap_id]
             return True
@@ -232,7 +236,7 @@ class ProductionDEX:
         for sid in stale_ids:
             if self.cancel_swap(sid, current_block=current_block):
                 cleaned += 1
-                print(f"  [ProductionDEX] Stale swap {sid[:16]}... auto-cancelled")
+                logger.info(f"  [ProductionDEX] Stale swap {sid[:16]}... auto-cancelled")
         return cleaned
 
     def get_balances(self, user: str) -> dict:

@@ -403,9 +403,11 @@ def create_flask_app(pdex: Optional[PersistentDEX] = None):
 
         try:
             if direction in VALID_DIRECTIONS_BTC:
-                ok = _pdex.swap_btc_to_anch(user, amount)
+                ok = _pdex.swap_btc_to_anch(user, amount,
+                                             slippage_bps=slippage_bps)
             else:
-                ok = _pdex.swap_anch_to_btc(user, amount)
+                ok = _pdex.swap_anch_to_btc(user, amount,
+                                             slippage_bps=slippage_bps)
         except (TypeError, ValueError, ArithmeticError) as exc:
             return jsonify(_error_body(
                 "SWAP_FAILED", str(exc), 400, _get_request_id(),

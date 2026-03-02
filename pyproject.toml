@@ -1,3 +1,20 @@
+[project]
+name = "anchor-dex"
+version = "0.1.0"
+description = "Fully on-chain Bitcoin DEX simulation with covenant AMM, RGB tokens, and HTLC atomic swaps"
+requires-python = ">=3.10"
+dependencies = [
+    "python-bitcoinlib>=0.12.2",
+    "coincurve>=21.0.0",
+    "flask>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "py>=1.11.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["py/tests"]
 python_files = "test_*.py"

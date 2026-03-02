@@ -224,7 +224,7 @@ malicious mutation after creation.  The `create()` factory validates
 
 **File:** `anchor/auction.py`
 
-- Three auction types: English, Dutch, sealed-bid
+- Five auction types: English, Dutch, sealed-bid, Vickrey, batch
 - Anti-sniping: deadline extension on late bids
 - Anti-griefing: minimum bid increment
 - Anti-sybil: `ReputationProfile` with success/failure tracking

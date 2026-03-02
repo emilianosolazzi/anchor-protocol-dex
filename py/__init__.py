@@ -14,5 +14,12 @@ Network: regtest
 """
 from __future__ import annotations
 
+import logging
+
+# Configure root logger for the package.  Users can override
+# by calling logging.basicConfig() or adding their own handlers
+# before importing this package.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 import bitcoin
 bitcoin.SelectParams('regtest')

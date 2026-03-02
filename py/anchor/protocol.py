@@ -17,6 +17,10 @@ Hardening:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from typing import Dict, List, Optional, Tuple
 
 from bitcoin.core import CTransaction

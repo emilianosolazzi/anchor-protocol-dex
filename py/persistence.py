@@ -5,6 +5,10 @@ Thread-safe: all mutations serialised via _mutex.
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import json
 import math
 import os
@@ -166,12 +170,12 @@ class PersistentDEX:
                     self.dex.htlc_engine._btc_balances[u["user"]] = u["btc_sats"]
                 if u["anch"] > 0:
                     self.dex.anch_rgb.balances[u["user"]] = u["anch"]
-            print(f"  [DB] Loaded pool state: BTC={saved['btc_reserve']:,}  "
+            logger.info(f"  [DB] Loaded pool state: BTC={saved['btc_reserve']:,}  "
                   f"ANCH={saved['anch_reserve']:,}  seq={saved['seq']}")
         else:
             self.dex = ProductionDEX()
             self._save_all()
-            print(f"  [DB] Initialised fresh pool (1 BTC / 10M ANCH)")
+            logger.info(f"  [DB] Initialised fresh pool (1 BTC / 10M ANCH)")
 
     def _save_all(self):
         self.store.save_pool(self.dex)
@@ -185,14 +189,14 @@ class PersistentDEX:
             self.dex.fund_user_btc(user, amount)
             self._save_user(user)
             self._save_all()
-            print(f"  Funded {user} with {amount:,} sats")
+            logger.info(f"  Funded {user} with {amount:,} sats")
 
     def fund_anch(self, user: str, amount: int):
         with self._mutex:
             self.dex.fund_user_anch(user, amount)
             self._save_user(user)
             self._save_all()
-            print(f"  Funded {user} with {amount:,} ANCH")
+            logger.info(f"  Funded {user} with {amount:,} ANCH")
 
     def _sync_oracle(self):
         """Sync oracle price from pool reserves after a swap."""
@@ -209,10 +213,12 @@ class PersistentDEX:
                     # the guard.
                     pass
 
-    def swap_btc_to_anch(self, user: str, btc_amount: int) -> bool:
+    def swap_btc_to_anch(self, user: str, btc_amount: int,
+                         slippage_bps: int = 50) -> bool:
         with self._mutex:
             try:
-                sid, _, _ = self.dex.swap_btc_for_anch(user, btc_amount)
+                sid, _, _ = self.dex.swap_btc_for_anch(user, btc_amount,
+                                                        slippage_bps=slippage_bps)
                 # Capture the actual ANCH output from the pending swap
                 anch_amount = self.dex._pending[sid]["anch_amount"]
                 ok = self.dex.complete_swap(sid)
@@ -224,13 +230,15 @@ class PersistentDEX:
                     self._save_all()
                 return ok
             except (ValueError, ArithmeticError) as e:
-                print(f"  Swap failed: {e}")
+                logger.info(f"  Swap failed: {e}")
                 return False
 
-    def swap_anch_to_btc(self, user: str, anch_amount: int) -> bool:
+    def swap_anch_to_btc(self, user: str, anch_amount: int,
+                         slippage_bps: int = 50) -> bool:
         with self._mutex:
             try:
-                sid, _, _ = self.dex.swap_anch_for_btc(user, anch_amount)
+                sid, _, _ = self.dex.swap_anch_for_btc(user, anch_amount,
+                                                        slippage_bps=slippage_bps)
                 # Capture the actual BTC output from the pending swap
                 btc_amount = self.dex._pending[sid]["btc_amount"]
                 ok = self.dex.complete_swap(sid)
@@ -243,7 +251,7 @@ class PersistentDEX:
                     self._save_all()
                 return ok
             except (ValueError, ArithmeticError) as e:
-                print(f"  Swap failed: {e}")
+                logger.info(f"  Swap failed: {e}")
                 return False
 
     def get_balances(self, user: str) -> dict:

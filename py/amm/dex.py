@@ -12,6 +12,10 @@ Improvements:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -73,7 +77,7 @@ class FullyOnChainDEX:
     ) -> OnChainPool:
         pool = OnChainPool(btc_reserve, anch_reserve, owner, config=config)
         self.pools[pool_id] = pool
-        print(f"  Pool '{pool_id}' created at {pool.state.taproot_address}")
+        logger.info(f"  Pool '{pool_id}' created at {pool.state.taproot_address}")
         return pool
 
     @non_reentrant
@@ -93,7 +97,7 @@ class FullyOnChainDEX:
             min_amount_out=min_amount_out,
         )
         if txid:
-            print(f"  User '{user}' proposed {swap_type.name} swap -> txid {txid[:16]}...")
+            logger.info(f"  User '{user}' proposed {swap_type.name} swap -> txid {txid[:16]}...")
         return txid
 
     @non_reentrant
@@ -120,7 +124,7 @@ class FullyOnChainDEX:
         signature: bytes,
     ) -> Optional[str]:
         if self.lp_balance_of(pool_id, user) < lp_to_burn:
-            print("  REMOVE_LIQUIDITY: insufficient LP balance")
+            logger.info("  REMOVE_LIQUIDITY: insufficient LP balance")
             return None
         pool = self._get_pool(pool_id)
         txid = pool.propose_liquidity_change(
@@ -154,7 +158,7 @@ class FullyOnChainDEX:
         pool = self._get_pool(pool_id)
         pending = pool.pending_swaps.get(txid)
         if pending is None:
-            print("  Invalid txid or swap already resolved")
+            logger.info("  Invalid txid or swap already resolved")
             return False
         fp = FraudProof(pending.old_state, txid, b'simulated_fraud_proof', challenger=challenger)
         return pool.challenge_swap(txid, challenger, fp)

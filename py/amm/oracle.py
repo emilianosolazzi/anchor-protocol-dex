@@ -12,6 +12,10 @@ Additions:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import math
 import time
 from collections import deque
@@ -53,14 +57,14 @@ class SimpleOracle:
     def update_price(self, new_price: float):
         new = float(new_price)
         if new <= 0 or math.isnan(new) or math.isinf(new):
-            print(f"  [ORACLE] REJECTED invalid price: {new_price}")
+            logger.info(f"  [ORACLE] REJECTED invalid price: {new_price}")
             raise ValueError(
                 f"Oracle price must be finite and > 0, got {new_price}"
             )
         if self._price > 0:
             ratio = abs(new - self._price) / self._price
             if ratio > self.MAX_UPDATE_DEVIATION / 10_000:
-                print(f"  [ORACLE] REJECTED: price change {ratio*100:.1f}% exceeds "
+                logger.info(f"  [ORACLE] REJECTED: price change {ratio*100:.1f}% exceeds "
                       f"max {self.MAX_UPDATE_DEVIATION/100:.0f}%")
                 raise ValueError(
                     f"Oracle price change too large: "
@@ -71,7 +75,7 @@ class SimpleOracle:
         self._updated_at = time.time()
         self._history.append((time.time(), self._price))
         self._update_count += 1
-        print(f"  [ORACLE] Price updated -> {new:.4f} sats/ANCH")
+        logger.info(f"  [ORACLE] Price updated -> {new:.4f} sats/ANCH")
 
     @property
     def price(self) -> float:
@@ -99,7 +103,7 @@ class SimpleOracle:
         if anch_amount <= 0:
             return False
         if self.age_seconds > self.MAX_STALENESS_SECS:
-            print(f"  [ORACLE] STALE: last update was {self.age_seconds:.0f}s ago "
+            logger.info(f"  [ORACLE] STALE: last update was {self.age_seconds:.0f}s ago "
                   f"(max {self.MAX_STALENESS_SECS}s)")
             return False
         lower = self._price * (10_000 - max_dev_bps) / 10_000
@@ -107,7 +111,7 @@ class SimpleOracle:
         btc_per_anch = btc_amount / anch_amount
         ok = lower <= btc_per_anch <= upper
         if not ok:
-            print(f"  [ORACLE] Price check FAILED: "
+            logger.info(f"  [ORACLE] Price check FAILED: "
                   f"implied={btc_per_anch:.4f} sats/ANCH "
                   f"oracle={self._price} "
                   f"allowed=[{lower:.4f}, {upper:.4f}]")

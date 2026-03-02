@@ -19,6 +19,10 @@ Security:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import json
 from typing import TYPE_CHECKING, Optional

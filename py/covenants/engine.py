@@ -15,6 +15,10 @@ swap invariants using the selected strategy's covenant primitives.
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import struct
 from typing import Dict, Optional

@@ -14,6 +14,10 @@ Hardening:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import re
 import time
@@ -258,12 +262,12 @@ class HTLCAtomicSwap:
         self.contracts[contract_id] = c
         self._sender_pending_count[sender] = pending + 1
 
-        print(f"  [HTLC] Contract {contract_id[:16]}... created: "
+        logger.info(f"  [HTLC] Contract {contract_id[:16]}... created: "
               f"{amount:,} sats {sender[:12]}... -> {recipient[:12]}... "
               f"timelock={timelock} blocks")
-        print(f"         Script: {real_htlc.hex()[:64]}...")
-        print(f"         P2WSH:  {real_htlc.p2wsh_scriptpubkey.hex()}")
-        print(f"         FundTX: {funding_txid_hex}")
+        logger.info(f"         Script: {real_htlc.hex()[:64]}...")
+        logger.info(f"         P2WSH:  {real_htlc.p2wsh_scriptpubkey.hex()}")
+        logger.info(f"         FundTX: {funding_txid_hex}")
         return c
 
     def settle_htlc(self, contract_id: str, secret: bytes) -> bool:
@@ -274,10 +278,10 @@ class HTLCAtomicSwap:
         """
         c = self.contracts.get(contract_id)
         if c is None:
-            print(f"  [HTLC] Unknown contract {contract_id[:16]}...")
+            logger.info(f"  [HTLC] Unknown contract {contract_id[:16]}...")
             return False
         if c.is_terminal:
-            print(f"  [HTLC] Contract {contract_id[:16]}... already "
+            logger.info(f"  [HTLC] Contract {contract_id[:16]}... already "
                   f"{'settled' if c.settled else 'refunded'}")
             return False
         if c.try_settle(secret):
@@ -286,10 +290,10 @@ class HTLCAtomicSwap:
             )
             self._dec_sender_pending(c.sender)
             del self.contracts[contract_id]
-            print(f"  [HTLC] Contract {contract_id[:16]}... settled "
+            logger.info(f"  [HTLC] Contract {contract_id[:16]}... settled "
                   f"({c.amount:,} sats -> {c.recipient[:12]}...)")
             return True
-        print(f"  [HTLC] Wrong secret for {contract_id[:16]}...")
+        logger.info(f"  [HTLC] Wrong secret for {contract_id[:16]}...")
         return False
 
     def refund_htlc(self, contract_id: str, current_block: int) -> bool:
@@ -304,13 +308,13 @@ class HTLCAtomicSwap:
         creation_block = int(c.created_at / 600)
         if not c.is_expired(current_block, creation_block):
             blocks_left = c.timelock - (current_block - creation_block)
-            print(f"  [HTLC] Timelock not expired ({blocks_left} blocks remaining)")
+            logger.info(f"  [HTLC] Timelock not expired ({blocks_left} blocks remaining)")
             return False
         c.refunded = True
         self._btc_balances[c.sender] = self._btc_balances.get(c.sender, 0) + c.amount
         self._dec_sender_pending(c.sender)
         del self.contracts[contract_id]
-        print(f"  [HTLC] Contract {contract_id[:16]}... refunded to {c.sender[:12]}...")
+        logger.info(f"  [HTLC] Contract {contract_id[:16]}... refunded to {c.sender[:12]}...")
         return True
 
     def _dec_sender_pending(self, sender: str):

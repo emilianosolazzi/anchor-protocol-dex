@@ -28,6 +28,10 @@ Security hardening:
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import struct
 import time
 from typing import Dict, List, Optional
@@ -95,7 +99,7 @@ class CovenantAMMScript:
         if not pubkey_hash or len(pubkey_hash) != 32:
             raise ValueError("pubkey_hash must be 32 bytes (SHA-256)")
         cls._pause_auth_hash = pubkey_hash
-        print(f"  [AMM] Pause authority set: {pubkey_hash.hex()[:16]}...")
+        logger.info(f"  [AMM] Pause authority set: {pubkey_hash.hex()[:16]}...")
 
     # -- Pause mechanism (FIX #10) -------------------------------------------
 
@@ -103,11 +107,11 @@ class CovenantAMMScript:
     def set_paused(cls, paused: bool, auth_signature: bytes) -> bool:
         """Allow authorized key to pause/unpause in emergencies."""
         if not cls.verify_pause_auth(auth_signature):
-            print("  [AMM] Pause auth FAILED")
+            logger.info("  [AMM] Pause auth FAILED")
             return False
         cls._paused = paused
         cls.emit_event("Paused" if paused else "Unpaused", {})
-        print(f"  [AMM] Contract {'PAUSED' if paused else 'UNPAUSED'}")
+        logger.info(f"  [AMM] Contract {'PAUSED' if paused else 'UNPAUSED'}")
         return True
 
     @classmethod
@@ -176,7 +180,7 @@ class CovenantAMMScript:
         if old_btc <= 0 or old_anch <= 0:
             return False
         if new_anch <= 0:
-            print("  [AMM] Price impact Inf (new_anch=0) -- REJECTED")
+            logger.info("  [AMM] Price impact Inf (new_anch=0) -- REJECTED")
             return False
 
         # Integer-only: |new_btc*old_anch - old_btc*new_anch| * 10000
@@ -189,7 +193,7 @@ class CovenantAMMScript:
             old_price = old_btc / old_anch
             new_price = new_btc / new_anch
             impact_bps = abs(new_price - old_price) / old_price * 10_000
-            print(f"  [AMM] Price impact {impact_bps:.0f} bps > "
+            logger.info(f"  [AMM] Price impact {impact_bps:.0f} bps > "
                   f"max {cls.MAX_PRICE_IMPACT} bps -- REJECTED")
             return False
         return True
@@ -212,12 +216,12 @@ class CovenantAMMScript:
             return False
         # FIX #8 -- reserve positivity
         if old_btc <= 0 or old_anch <= 0:
-            print("  [AMM] Invalid pool state: reserves must be positive")
+            logger.info("  [AMM] Invalid pool state: reserves must be positive")
             return False
         # FIX #8 -- 50% max pool drain
         max_in = old_btc * cls.MAX_SWAP_RATIO // 10_000
         if btc_in > max_in:
-            print(f"  [AMM] Swap too large: {btc_in:,} > max {max_in:,} "
+            logger.info(f"  [AMM] Swap too large: {btc_in:,} > max {max_in:,} "
                   f"({cls.MAX_SWAP_RATIO / 100:.0f}% of reserve)")
             return False
         if new_btc != old_btc + btc_in:
@@ -228,7 +232,7 @@ class CovenantAMMScript:
             return False
         # FIX #3 -- slippage guard
         if anch_out < min_amount_out:
-            print(f"  [AMM] Slippage guard: {anch_out} < min {min_amount_out}")
+            logger.info(f"  [AMM] Slippage guard: {anch_out} < min {min_amount_out}")
             return False
         # FIX #7 -- price impact guard
         if not cls.check_price_impact(old_btc, old_anch, new_btc, new_anch):
@@ -275,12 +279,12 @@ class CovenantAMMScript:
             return False
         # FIX #8 -- reserve positivity
         if old_btc <= 0 or old_anch <= 0:
-            print("  [AMM] Invalid pool state: reserves must be positive")
+            logger.info("  [AMM] Invalid pool state: reserves must be positive")
             return False
         # FIX #8 -- 50% max pool drain
         max_in = old_anch * cls.MAX_SWAP_RATIO // 10_000
         if anch_in > max_in:
-            print(f"  [AMM] Swap too large: {anch_in:,} > max {max_in:,} "
+            logger.info(f"  [AMM] Swap too large: {anch_in:,} > max {max_in:,} "
                   f"({cls.MAX_SWAP_RATIO / 100:.0f}% of reserve)")
             return False
         if new_anch != old_anch + anch_in:
@@ -290,7 +294,7 @@ class CovenantAMMScript:
         if new_btc < 0:
             return False
         if btc_out < min_amount_out:
-            print(f"  [AMM] Slippage guard: {btc_out} < min {min_amount_out}")
+            logger.info(f"  [AMM] Slippage guard: {btc_out} < min {min_amount_out}")
             return False
         if not cls.check_price_impact(old_btc, old_anch, new_btc, new_anch):
             return False
@@ -358,7 +362,7 @@ class CovenantAMMScript:
             return False
         # FIX #11 -- minimum initial liquidity floor (anti-dust)
         if old_lp == 0 and lp_minted < cls.MIN_LIQUIDITY:
-            print(f"  [AMM] Initial liquidity too low: {lp_minted} "
+            logger.info(f"  [AMM] Initial liquidity too low: {lp_minted} "
                   f"< {cls.MIN_LIQUIDITY}")
             return False
         if old_lp > 0:
@@ -367,7 +371,7 @@ class CovenantAMMScript:
             if abs(ratio_btc * old_anch - ratio_anch * old_btc) > (
                 old_btc * old_anch
             ):
-                print("  [AMM] Skewed add-liquidity rejected")
+                logger.info("  [AMM] Skewed add-liquidity rejected")
                 return False
         cls.emit_event("AddLiquidity", {
             "btc_added": btc_added, "anch_added": anch_added,
@@ -404,10 +408,10 @@ class CovenantAMMScript:
         # btc_removed * old_lp <= lp_burned * old_btc
         if old_lp > 0:
             if btc_removed * old_lp > lp_burned * old_btc:
-                print("  [AMM] Remove exceeds proportional BTC share")
+                logger.info("  [AMM] Remove exceeds proportional BTC share")
                 return False
             if anch_removed * old_lp > lp_burned * old_anch:
-                print("  [AMM] Remove exceeds proportional ANCH share")
+                logger.info("  [AMM] Remove exceeds proportional ANCH share")
                 return False
         cls.emit_event("RemoveLiquidity", {
             "btc_removed": btc_removed, "anch_removed": anch_removed,
@@ -568,7 +572,7 @@ class CovenantAMMScript:
             recent = [e for e in cls._events[-max_swaps_per_block:]
                       if e.get("type") == "Swap"]
             if len(recent) >= max_swaps_per_block:
-                print(f"  [AMM] Flash loan guard: {len(recent)} swaps "
+                logger.info(f"  [AMM] Flash loan guard: {len(recent)} swaps "
                       f"in block {current_block} (max {max_swaps_per_block})")
                 return False
         cls._last_swap_block = current_block
@@ -607,7 +611,7 @@ class CovenantAMMScript:
         """
         # FIX #10 -- emergency pause
         if cls._paused:
-            print("  [AMM] Contract is PAUSED")
+            logger.info("  [AMM] Contract is PAUSED")
             return False
         if len(witness_stack) < 6:
             return False
