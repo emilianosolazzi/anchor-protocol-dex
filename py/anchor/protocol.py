@@ -19,20 +19,24 @@ from .truc import AnchorProof
 from .verifier import AnchorVerifier, ClaimRegistry
 from .brc20 import BRC20Inscription
 from .minter import ProofOfAnchorMinter
-from .auction import SlotAuction, AnchorSlot
+from .auction import SlotAuction, AnchorSlot, AuctionType, AuctionConfig
 
 
 class AnchorProtocol:
     """Main entry point for external callers."""
 
-    def __init__(self, anch_asset: Optional[RGBAsset] = None):
+    def __init__(
+        self,
+        anch_asset: Optional[RGBAsset] = None,
+        auction_config: Optional[AuctionConfig] = None,
+    ):
         self.anch = anch_asset or RGBAsset("ANCH")
         self.registry = ClaimRegistry()
         self.minter = ProofOfAnchorMinter(
             self.anch, self.registry,
             genesis_bonus=500, genesis_count=100,
         )
-        self.auction = SlotAuction(self.anch, self.registry)
+        self.auction = SlotAuction(self.anch, self.registry, auction_config)
         self.deploy_inscription = BRC20Inscription.deploy()
 
     def submit_anchor_proof(
@@ -55,8 +59,13 @@ class AnchorProtocol:
         return self.minter.submit_proof(proof, parent_tx, child_tx)
 
     def create_slot(self, block_start: int, block_end: int,
-                    min_fee_rate: int = 5) -> AnchorSlot:
-        return self.auction.create_slot(block_start, block_end, min_fee_rate)
+                    min_fee_rate: int = 5,
+                    auction_type: AuctionType = AuctionType.ENGLISH,
+                    duration: float = 600.0) -> AnchorSlot:
+        return self.auction.create_slot(
+            block_start, block_end, min_fee_rate,
+            auction_type=auction_type, duration=duration,
+        )
 
     def bid_on_slot(self, slot_id: str, bidder: str,
                     anch_amount: int) -> Tuple[bool, str]:
