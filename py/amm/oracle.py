@@ -35,6 +35,7 @@ class SimpleOracle:
     MAX_ORACLE_DEVIATION = 1000  # basis points (10 %)
     MAX_UPDATE_DEVIATION = 5000  # max 50% change per update (basis points)
     MAX_STALENESS_SECS = 3600   # reject checks if oracle older than 1 hr
+    MAX_HISTORY = 1000          # ring buffer cap for price history
 
     def __init__(self, initial_price_sats_per_anch: float):
         if not isinstance(initial_price_sats_per_anch, (int, float)):
@@ -46,7 +47,7 @@ class SimpleOracle:
         # Integer representation: price * 10^8 for precision
         self._price_fixed: int = int(price * 10**8)
         self._updated_at = time.time()
-        self._history: List[Tuple[float, float]] = [(time.time(), self._price)]
+        self._history: deque = deque([(time.time(), self._price)], maxlen=self.MAX_HISTORY)
         self._update_count: int = 0
 
     def update_price(self, new_price: float):

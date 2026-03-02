@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-quickstart.py — ANCHOR DEX in ~100 lines: fund → swap → withdraw
+quickstart.py -- ANCHOR DEX in ~100 lines: fund -> swap -> withdraw
 
 Run:
     cd c:\\Users\\comar\\Downloads
@@ -19,15 +19,16 @@ from py.production import ProductionDEX
 def main():
     SEP = "=" * 60
     print(SEP)
-    print("  ANCHOR DEX — Quickstart Demo")
+    print("  ANCHOR DEX -- Quickstart Demo")
     print(SEP)
 
     # 1. Boot a production DEX (100 M sats BTC, 10 M ANCH)
     dex = ProductionDEX(initial_btc=100_000_000, initial_anch=10_000_000)
+    info0 = dex.get_pool_info()
     print("\n  Pool created:")
-    print(f"    BTC reserve : {dex.pool.state.btc_reserve:>12,} sats")
-    print(f"    ANCH reserve: {dex.pool.state.anch_reserve:>12,}")
-    print(f"    LP total    : {dex.pool.state.lp_total:>12,}")
+    print(f"    BTC reserve : {info0['btc_reserve']:>12,} sats")
+    print(f"    ANCH reserve: {info0['anch_reserve']:>12,}")
+    print(f"    LP total    : {info0['lp_total']:>12,}")
 
     # 2. Fund two users
     dex.fund_user_btc("alice", 20_000_000)
@@ -38,24 +39,30 @@ def main():
 
     # 3. Alice swaps 5 M sats → ANCH
     print(f"\n{'_'*60}")
-    print("  Alice: 5,000,000 sats → ANCH")
+    print("  Alice: 5,000,000 sats -> ANCH")
     print(f"{'_'*60}")
-    swap_id, btc_used, anch_received = dex.swap_btc_for_anch("alice", 5_000_000)
+    bal_before = dex.get_balances("alice")
+    swap_id, _htlc, _rgb = dex.swap_btc_for_anch("alice", 5_000_000)
     dex.complete_swap(swap_id)
     bal_a = dex.get_balances("alice")
-    print(f"    BTC spent  : {btc_used:>12,} sats")
-    print(f"    ANCH gained: {anch_received:>12,}")
+    btc_spent = bal_before["btc_sats"] - bal_a["btc_sats"]
+    anch_gained = bal_a["anch"] - bal_before["anch"]
+    print(f"    BTC spent  : {btc_spent:>12,} sats")
+    print(f"    ANCH gained: {anch_gained:>12,}")
     print(f"    alice now  : {bal_a['btc_sats']:>12,} sats / {bal_a['anch']:>12,} ANCH")
 
     # 4. Bob swaps 500 k ANCH → BTC
     print(f"\n{'_'*60}")
-    print("  Bob: 500,000 ANCH → sats")
+    print("  Bob: 500,000 ANCH -> sats")
     print(f"{'_'*60}")
-    swap_id2, anch_used, btc_received = dex.swap_anch_for_btc("bob", 500_000)
+    bal_before_b = dex.get_balances("bob")
+    swap_id2, _rgb2, _htlc2 = dex.swap_anch_for_btc("bob", 500_000)
     dex.complete_swap(swap_id2)
     bal_b = dex.get_balances("bob")
-    print(f"    ANCH spent : {anch_used:>12,}")
-    print(f"    BTC gained : {btc_received:>12,} sats")
+    anch_spent = bal_before_b["anch"] - bal_b["anch"]
+    btc_gained = bal_b["btc_sats"] - bal_before_b["btc_sats"]
+    print(f"    ANCH spent : {anch_spent:>12,}")
+    print(f"    BTC gained : {btc_gained:>12,} sats")
     print(f"    bob now    : {bal_b['btc_sats']:>12,} sats / {bal_b['anch']:>12,} ANCH")
 
     # 5. Cancel an in-progress swap (HTLC timeout refund)

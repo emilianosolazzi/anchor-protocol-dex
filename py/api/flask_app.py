@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -60,31 +61,55 @@ VALID_DIRECTIONS = VALID_DIRECTIONS_BTC | VALID_DIRECTIONS_ANCH
 # Rate limit: 60 requests / minute per IP (token bucket)
 RATE_LIMIT_CAPACITY = 60
 RATE_LIMIT_REFILL_PER_SEC = 1.0
+RATE_LIMIT_MAX_BUCKETS = 10_000  # LRU cap to prevent memory leak
+
+# API key authentication (optional).
+# Set ANCHOR_DEX_API_KEY env var to enable; when unset, all
+# requests are allowed (regtest / development mode).
+API_KEY = os.environ.get("ANCHOR_DEX_API_KEY")
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 class _TokenBucket:
-    """Simple per-key token bucket rate limiter."""
+    """
+    Simple per-key token bucket rate limiter with LRU eviction.
 
-    __slots__ = ("_capacity", "_refill_rate", "_buckets")
+    Maintains at most ``max_buckets`` entries.  When the cap is
+    reached the oldest-accessed bucket is evicted.
+    """
 
-    def __init__(self, capacity: int, refill_per_sec: float):
+    __slots__ = ("_capacity", "_refill_rate", "_buckets", "_max_buckets")
+
+    def __init__(self, capacity: int, refill_per_sec: float,
+                 max_buckets: int = RATE_LIMIT_MAX_BUCKETS):
         self._capacity = capacity
         self._refill_rate = refill_per_sec
-        # key -> (tokens, last_refill_timestamp)
-        self._buckets: Dict[str, list] = defaultdict(
-            lambda: [float(capacity), time.monotonic()]
-        )
+        self._max_buckets = max_buckets
+        # key -> [tokens, last_refill_timestamp]
+        self._buckets: Dict[str, list] = {}
+
+    def _evict_oldest(self) -> None:
+        """Remove the bucket with the oldest last-access time."""
+        if not self._buckets:
+            return
+        oldest_key = min(self._buckets, key=lambda k: self._buckets[k][1])
+        del self._buckets[oldest_key]
 
     def allow(self, key: str) -> Tuple[bool, int]:
         """
         Consume one token for *key*.
         Returns (allowed, remaining_tokens).
         """
-        bucket = self._buckets[key]
         now = time.monotonic()
+        if key not in self._buckets:
+            # Evict oldest if at capacity
+            if len(self._buckets) >= self._max_buckets:
+                self._evict_oldest()
+            self._buckets[key] = [float(self._capacity), now]
+
+        bucket = self._buckets[key]
         elapsed = now - bucket[1]
         bucket[0] = min(self._capacity, bucket[0] + elapsed * self._refill_rate)
         bucket[1] = now
@@ -149,6 +174,17 @@ def create_flask_app(pdex: Optional[PersistentDEX] = None):
         if request.method == "OPTIONS":
             return "", 204
 
+        # API key authentication (skip for health probes)
+        if API_KEY and request.path not in ("/health", f"/api/{API_VERSION}/health"):
+            provided = request.headers.get("X-API-Key", "")
+            if provided != API_KEY:
+                return jsonify(_error_body(
+                    "UNAUTHORIZED",
+                    "Missing or invalid X-API-Key header.",
+                    401,
+                    rid,
+                )[0]), 401
+
         # Rate limiting
         client_ip = request.remote_addr or "unknown"
         allowed, remaining = _rate_limiter.allow(client_ip)
@@ -175,7 +211,7 @@ def create_flask_app(pdex: Optional[PersistentDEX] = None):
             "GET, POST, OPTIONS"
         )
         response.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-Request-ID"
+            "Content-Type, X-Request-ID, X-API-Key"
         )
         return response
 

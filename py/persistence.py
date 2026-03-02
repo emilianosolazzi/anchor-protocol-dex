@@ -195,23 +195,31 @@ class PersistentDEX:
             print(f"  Funded {user} with {amount:,} ANCH")
 
     def _sync_oracle(self):
+        """Sync oracle price from pool reserves after a swap."""
         info = self.dex.get_pool_info()
         if info["anch_reserve"] > 0:
             new_price = float(info["btc_reserve"] / info["anch_reserve"])
             if new_price > 0 and not math.isnan(new_price) and not math.isinf(new_price):
-                self.dex.oracle._price = new_price
-                self.dex.oracle._updated_at = time.time()
-                self.dex.oracle._history.append((time.time(), new_price))
+                try:
+                    self.dex.oracle.update_price(new_price)
+                except ValueError:
+                    # Deviation guard rejected the update — this can happen
+                    # after a large swap.  Fall through; oracle keeps its
+                    # last-known-good price which is safer than bypassing
+                    # the guard.
+                    pass
 
     def swap_btc_to_anch(self, user: str, btc_amount: int) -> bool:
         with self._mutex:
             try:
                 sid, _, _ = self.dex.swap_btc_for_anch(user, btc_amount)
+                # Capture the actual ANCH output from the pending swap
+                anch_amount = self.dex._pending[sid]["anch_amount"]
                 ok = self.dex.complete_swap(sid)
                 if ok:
                     self._sync_oracle()
                     self.store.record_swap(sid, user, "BTC_TO_ANCH", btc_amount,
-                                           self.dex.get_balances(user)["anch"])
+                                           anch_amount)
                     self._save_user(user)
                     self._save_all()
                 return ok
@@ -223,11 +231,13 @@ class PersistentDEX:
         with self._mutex:
             try:
                 sid, _, _ = self.dex.swap_anch_for_btc(user, anch_amount)
+                # Capture the actual BTC output from the pending swap
+                btc_amount = self.dex._pending[sid]["btc_amount"]
                 ok = self.dex.complete_swap(sid)
                 if ok:
                     self._sync_oracle()
                     self.store.record_swap(sid, user, "ANCH_TO_BTC",
-                                           self.dex.get_balances(user)["btc_sats"],
+                                           btc_amount,
                                            anch_amount)
                     self._save_user(user)
                     self._save_all()

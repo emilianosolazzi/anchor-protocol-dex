@@ -44,8 +44,13 @@ class CovenantAMMScript:
     """
     On-chain AMM verification logic.
 
-    All methods are static -- they represent script-level checks
-    that would run inside a Taproot leaf.
+    All methods are static/classmethod -- they represent script-level
+    checks that would run inside a Taproot leaf.
+
+    **Singleton pattern**: mutable state (_events, _fee_accumulator,
+    _paused, _last_swap_block) is class-level because on-chain there
+    is exactly one instance of the script per pool.  Call ``reset()``
+    between test runs to isolate state.
 
     The class-level defaults are used when no PoolConfig is provided.
     In production each pool would have its own config committed in
@@ -59,10 +64,38 @@ class CovenantAMMScript:
     MAX_PRICE_IMPACT = 1500     # 15% max price impact (basis points)
     MAX_SWAP_RATIO = 5000       # FIX #8: 50% max pool drain per swap (bps)
     MIN_LIQUIDITY = 1000        # FIX #11: minimum LP tokens for initial deposit
-    PAUSED = False              # FIX #10: emergency pause state
+
+    # Mutable singleton state (use reset() between tests)
+    _paused: bool = False       # FIX #10: emergency pause state
     _events: List[Dict] = []    # Event log (OP_RETURN-style)
     _fee_accumulator: FeeAccumulator = FeeAccumulator()
     _last_swap_block: int = 0   # FIX #16: flash loan detection
+    _MAX_EVENTS = 10_000        # cap event log (ring buffer)
+
+    # Authorized pause key (SHA-256 digest).  Override via
+    # ``set_pause_authority()`` or set to None to accept any key
+    # (development/regtest mode only).
+    _pause_auth_hash: Optional[bytes] = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset all mutable singleton state (for testing)."""
+        cls._paused = False
+        cls._events = []
+        cls._fee_accumulator = FeeAccumulator()
+        cls._last_swap_block = 0
+
+    @classmethod
+    def set_pause_authority(cls, pubkey_hash: bytes) -> None:
+        """
+        Register the SHA-256 hash of the authorized pause key.
+        Once set, ``set_paused()`` requires a signature whose
+        SHA-256 matches this hash.
+        """
+        if not pubkey_hash or len(pubkey_hash) != 32:
+            raise ValueError("pubkey_hash must be 32 bytes (SHA-256)")
+        cls._pause_auth_hash = pubkey_hash
+        print(f"  [AMM] Pause authority set: {pubkey_hash.hex()[:16]}...")
 
     # -- Pause mechanism (FIX #10) -------------------------------------------
 
@@ -72,19 +105,28 @@ class CovenantAMMScript:
         if not cls.verify_pause_auth(auth_signature):
             print("  [AMM] Pause auth FAILED")
             return False
-        cls.PAUSED = paused
+        cls._paused = paused
         cls.emit_event("Paused" if paused else "Unpaused", {})
         print(f"  [AMM] Contract {'PAUSED' if paused else 'UNPAUSED'}")
         return True
 
-    @staticmethod
-    def verify_pause_auth(auth_signature: bytes) -> bool:
+    @classmethod
+    def verify_pause_auth(cls, auth_signature: bytes) -> bool:
         """
         Verify the pause authorization.
-        In production this would check a 2-of-3 multisig;
-        here we accept any non-empty signature.
+
+        If ``_pause_auth_hash`` is set, the SHA-256 of
+        *auth_signature* must match it.  Otherwise (dev/regtest
+        mode) any non-empty signature is accepted.
         """
-        return len(auth_signature) > 0
+        if not auth_signature or len(auth_signature) == 0:
+            return False
+        if cls._pause_auth_hash is not None:
+            import hashlib
+            sig_hash = hashlib.sha256(auth_signature).digest()
+            return sig_hash == cls._pause_auth_hash
+        # Dev/regtest: accept any non-empty signature
+        return True
 
     # -- Event emission -------------------------------------------------------
 
@@ -96,6 +138,9 @@ class CovenantAMMScript:
             "data": data,
             "timestamp": time.time(),
         })
+        # Cap event log to prevent unbounded growth
+        if len(cls._events) > cls._MAX_EVENTS:
+            cls._events = cls._events[-cls._MAX_EVENTS:]
 
     @classmethod
     def get_events(cls, event_type: Optional[str] = None,
@@ -561,7 +606,7 @@ class CovenantAMMScript:
         Verifies sequence, state transition, and swap validity.
         """
         # FIX #10 -- emergency pause
-        if cls.PAUSED:
+        if cls._paused:
             print("  [AMM] Contract is PAUSED")
             return False
         if len(witness_stack) < 6:

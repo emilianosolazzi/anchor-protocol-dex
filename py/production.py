@@ -23,6 +23,7 @@ from .anchor.protocol import AnchorProtocol
 class ProductionDEX:
     POOL_ADDRESS = "pool_taproot_address_v1"
     SLIPPAGE_BPS = 50  # FIX #3 -- default 0.5 % slippage tolerance
+    PENDING_TTL_SECS = 3600  # Abandon pending swaps older than 1 hour
 
     def __init__(self, initial_btc: int = 100_000_000, initial_anch: int = 10_000_000):
         # Layer 1 -- RGB token ledger
@@ -58,7 +59,7 @@ class ProductionDEX:
         anch_amount = self.liquidity_pool.get_quote(SwapType.BTC_TO_ANCH, btc_amount)
         print(f"  [ProductionDEX] AMM quote: {btc_amount:,} sats -> {anch_amount:,} ANCH")
 
-        if not self.oracle.check_price(btc_amount, anch_amount):
+        if not self.oracle.check_price_integer(btc_amount, anch_amount):
             raise ValueError("[ProductionDEX] Oracle price check failed -- swap aborted")
 
         min_out = anch_amount * (10_000 - slippage_bps) // 10_000
@@ -91,6 +92,7 @@ class ProductionDEX:
             "secret": secret,
             "htlc": btc_htlc,
             "rgb_transfer": anch_transfer,
+            "created_at": time.time(),
         }
         print(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
               f"Call complete_swap() to reveal secret and settle.")
@@ -107,7 +109,7 @@ class ProductionDEX:
         btc_amount = self.liquidity_pool.get_quote(SwapType.ANCH_TO_BTC, anch_amount)
         print(f"  [ProductionDEX] AMM quote: {anch_amount:,} ANCH -> {btc_amount:,} sats")
 
-        if not self.oracle.check_price(btc_amount, anch_amount):
+        if not self.oracle.check_price_integer(btc_amount, anch_amount):
             raise ValueError("[ProductionDEX] Oracle price check failed -- swap aborted")
 
         min_out = btc_amount * (10_000 - slippage_bps) // 10_000
@@ -140,6 +142,7 @@ class ProductionDEX:
             "secret": secret,
             "htlc": btc_htlc,
             "rgb_transfer": anch_transfer,
+            "created_at": time.time(),
         }
         print(f"  [ProductionDEX] Swap {swap_id[:16]}... initiated. "
               f"Call complete_swap() to reveal secret and settle.")
@@ -213,6 +216,24 @@ class ProductionDEX:
             del self._pending[swap_id]
             return True
         return False
+
+    def cleanup_stale_swaps(self, current_block: int = 999_999) -> int:
+        """
+        Cancel and refund pending swaps older than PENDING_TTL_SECS.
+
+        Returns the number of swaps cleaned up.
+        """
+        now = time.time()
+        stale_ids = [
+            sid for sid, entry in self._pending.items()
+            if now - entry.get("created_at", 0) > self.PENDING_TTL_SECS
+        ]
+        cleaned = 0
+        for sid in stale_ids:
+            if self.cancel_swap(sid, current_block=current_block):
+                cleaned += 1
+                print(f"  [ProductionDEX] Stale swap {sid[:16]}... auto-cancelled")
+        return cleaned
 
     def get_balances(self, user: str) -> dict:
         return {

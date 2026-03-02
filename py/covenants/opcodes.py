@@ -89,22 +89,8 @@ def hash256(data: bytes) -> bytes:
 
 # Cache tag hashes: SHA256(tag) is constant per tag string, so we
 # precompute once.  This matches Bitcoin Core's optimization.
-_TAGGED_HASH_MIDSTATES: dict[str, bytes] = {}
-
-
-def tagged_hash(tag: str, msg: bytes) -> bytes:
-    """
-    BIP-340 tagged hash: SHA256( SHA256(tag) || SHA256(tag) || msg ).
-
-    Used throughout Taproot (BIP-340/341/342) for domain separation.
-    Tags: "TapTweak", "TapLeaf", "TapBranch", "TapSighash",
-          "BIP0340/challenge", "BIP0340/aux", "BIP0340/nonce".
-    """
-    if tag not in _TAGGED_HASH_MIDSTATES:
-        tag_hash = hashlib.sha256(tag.encode('utf-8')).digest()
-        _TAGGED_HASH_MIDSTATES[tag] = tag_hash
-    tag_hash = _TAGGED_HASH_MIDSTATES[tag]
-    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+# Re-export from crypto.keys to avoid duplicate implementations.
+from ..crypto.keys import tagged_hash  # noqa: F401
 
 
 def hash160(data: bytes) -> bytes:
