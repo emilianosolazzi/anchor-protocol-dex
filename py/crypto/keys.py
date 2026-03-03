@@ -14,19 +14,19 @@ Improvements:
 """
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 import hashlib
 import hmac
-from typing import Dict, Optional, Tuple
+import logging
+import threading
+from typing import Dict, List, Optional, Tuple
 
 from coincurve import PrivateKey, PublicKey
 from bitcoin.core import CScript
 from bitcoin.core.script import (
     OP_0, OP_1, OP_DUP, OP_HASH160, OP_EQUALVERIFY, OP_CHECKSIG,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,7 @@ class BitcoinKeyStore:
     def __init__(self, network: str = "regtest"):
         self._keys: Dict[str, PrivateKey] = {}
         self._network: str = network
+        self._lock = threading.Lock()
 
     def set_network(self, network: str) -> None:
         """
@@ -100,7 +101,8 @@ class BitcoinKeyStore:
                     f"externally-generated entropy for mainnet/liquid."
                 )
             seed = hashlib.sha256(f"anchor_dex_key:{alias}".encode()).digest()
-            self._keys[alias] = PrivateKey(seed)
+            with self._lock:
+                self._keys[alias] = PrivateKey(seed)
 
     def get_or_create(self, alias: str) -> PrivateKey:
         self._ensure(alias)
@@ -110,14 +112,26 @@ class BitcoinKeyStore:
         """
         Import a private key from raw 32-byte secret.
         Validates that the secret is in [1, n-1].
+        Bypasses the network guard — caller is responsible for key quality.
         """
         if len(secret) != 32:
             raise ValueError(f"Private key must be 32 bytes, got {len(secret)}")
         scalar = int.from_bytes(secret, 'big')
         if scalar == 0 or scalar >= SECP256K1_ORDER:
             raise ValueError("Private key scalar out of range [1, n-1]")
-        self._keys[alias] = PrivateKey(secret)
+        with self._lock:
+            self._keys[alias] = PrivateKey(secret)
         return self._keys[alias]
+
+    def remove_key(self, alias: str) -> bool:
+        """Remove a key by alias.  Returns True if it existed."""
+        with self._lock:
+            return self._keys.pop(alias, None) is not None
+
+    def clear(self) -> None:
+        """Remove all keys.  Useful for test teardown."""
+        with self._lock:
+            self._keys.clear()
 
     def has_key(self, alias: str) -> bool:
         """Check if a key exists without creating one."""
@@ -184,18 +198,29 @@ class BitcoinKeyStore:
 
     def _tweak_pubkey(self, alias: str, tweak: bytes) -> bytes:
         """
-        Compute tweaked x-only output key.
+        Compute tweaked x-only output key via real EC point addition.
 
         output_key = internal_key + tweak * G
 
-        This is a simplified simulation — in production you'd use
-        libsecp256k1's xonly_pubkey_tweak_add.
+        Uses coincurve's EC arithmetic:
+          1.  Compute tweak_point = tweak * G  (via PrivateKey(tweak).public_key)
+          2.  Add internal_key + tweak_point   (via PublicKey.combine)
+          3.  Return the 32-byte x-only result.
         """
         self._ensure(alias)
-        compressed = self.pubkey(alias)
-        # Simulate tweak by hashing internal + tweak (real impl uses EC math)
-        tweaked = hashlib.sha256(compressed + tweak).digest()
-        return tweaked
+        internal_pub = self._keys[alias].public_key
+        # tweak * G
+        tweak_scalar = int.from_bytes(tweak, 'big') % SECP256K1_ORDER
+        if tweak_scalar == 0:
+            # Degenerate tweak — return internal key's x-only unchanged
+            return internal_pub.format(compressed=True)[1:]
+        tweak_key = PrivateKey(tweak_scalar.to_bytes(32, 'big'))
+        # output_point = internal + tweak*G
+        output_pub = PublicKey.combine_keys(
+            [internal_pub, tweak_key.public_key]
+        )
+        # x-only (drop the 0x02/0x03 prefix)
+        return output_pub.format(compressed=True)[1:]
 
     # -- Signing -----------------------------------------------------------
 
@@ -255,12 +280,24 @@ class BitcoinKeyStore:
     # -- Address helpers ---------------------------------------------------
 
     def address_hex(self, alias: str) -> str:
-        """Mock bech32-style address for display (SegWit v0)."""
+        """
+        Simulated bech32 address for display (SegWit v0).
+
+        NOTE: This is NOT a valid bech32 encoding — it concatenates
+        the "bcrt1q" prefix with the raw hex of HASH160(pubkey).
+        Suitable for simulation / log readability only.
+        """
         pkh = self.pubkey_hash(alias)
         return f"bcrt1q{pkh.hex()}"
 
     def address_p2tr(self, alias: str) -> str:
-        """Mock bech32m-style address for display (SegWit v1 / Taproot)."""
+        """
+        Simulated bech32m address for display (SegWit v1 / Taproot).
+
+        NOTE: This is NOT a valid bech32m encoding — it concatenates
+        the "bcrt1p" prefix with the hex of the tweaked output key.
+        Suitable for simulation / log readability only.
+        """
         x_only = self.x_only_pubkey(alias)
         tweak = tagged_hash("TapTweak", x_only)
         output_key = self._tweak_pubkey(alias, tweak)
@@ -280,9 +317,15 @@ class BitcoinKeyStore:
         }
 
     @property
-    def aliases(self) -> list:
+    def aliases(self) -> List[str]:
         """List all known aliases."""
         return list(self._keys.keys())
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __contains__(self, alias: str) -> bool:
+        return alias in self._keys
 
 
 # Module-level singleton -- imported everywhere

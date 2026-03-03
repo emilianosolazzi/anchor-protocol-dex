@@ -1,5 +1,5 @@
 """
-Tests for the crypto layer: keys, scripts, transactions.
+Tests for the crypto layer: keys, scripts, transactions, PSBT.
 """
 import hashlib
 import os
@@ -17,7 +17,7 @@ from py.crypto.scripts import (
 )
 from py.crypto.transactions import (
     RealTransactionBuilder, estimate_vsize, estimate_fee,
-    DUST_THRESHOLD,
+    DUST_THRESHOLD, PSBT, PSBTInput, PSBTOutput, PSBTRole,
 )
 
 
@@ -380,3 +380,307 @@ class TestRealTransactionBuilder:
         )
         assert isinstance(tx, CTransaction)
         assert len(sighash) == 32
+
+
+# ---------------------------------------------------------------------------
+# KeyStore — new features (clear, remove, thread safety, EC tweak)
+# ---------------------------------------------------------------------------
+
+class TestKeyStoreNewFeatures:
+    def test_clear(self):
+        ks = BitcoinKeyStore()
+        ks.get_or_create("c1")
+        ks.get_or_create("c2")
+        assert len(ks) >= 2
+        ks.clear()
+        assert len(ks) == 0
+        assert "c1" not in ks
+
+    def test_remove_key(self):
+        ks = BitcoinKeyStore()
+        ks.get_or_create("rem1")
+        assert ks.remove_key("rem1") is True
+        assert ks.remove_key("rem1") is False
+        assert "rem1" not in ks
+
+    def test_contains(self):
+        ks = BitcoinKeyStore()
+        assert "cont_test" not in ks
+        ks.get_or_create("cont_test")
+        assert "cont_test" in ks
+
+    def test_len(self):
+        ks = BitcoinKeyStore()
+        assert len(ks) == 0
+        ks.get_or_create("l1")
+        assert len(ks) == 1
+
+    def test_ec_tweak_deterministic(self):
+        """_tweak_pubkey should produce the same result for the same inputs."""
+        ks = BitcoinKeyStore()
+        tweak = tagged_hash("TapTweak", ks.x_only_pubkey("tw_test"))
+        r1 = ks._tweak_pubkey("tw_test", tweak)
+        r2 = ks._tweak_pubkey("tw_test", tweak)
+        assert r1 == r2
+        assert len(r1) == 32  # x-only
+
+    def test_ec_tweak_changes_key(self):
+        """Tweaked key should differ from the original internal key."""
+        ks = BitcoinKeyStore()
+        x_only = ks.x_only_pubkey("tw_diff")
+        tweak = tagged_hash("TapTweak", x_only)
+        tweaked = ks._tweak_pubkey("tw_diff", tweak)
+        assert tweaked != x_only
+
+    def test_p2tr_uses_real_ec_tweak(self):
+        """p2tr_scriptpubkey should produce a 34-byte script (OP_1 + 32 bytes)."""
+        ks = BitcoinKeyStore()
+        script = ks.p2tr_scriptpubkey("p2tr_ec")
+        assert isinstance(script, CScript)
+        # OP_1 (1 byte) + push-32 (1 byte) + 32-byte key = 34 bytes
+        assert len(script) == 34
+
+    def test_thread_safety_concurrent_create(self):
+        """Multiple threads creating keys should not corrupt state."""
+        import threading
+        ks = BitcoinKeyStore()
+        errors = []
+
+        def worker(alias):
+            try:
+                ks.get_or_create(alias)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(f"thr_{i}",))
+                   for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert len(ks) == 20
+
+
+# ---------------------------------------------------------------------------
+# PSBT
+# ---------------------------------------------------------------------------
+
+def _make_unsigned_tx():
+    """Helper: build a simple unsigned 1-in-1-out tx."""
+    outpoint = COutPoint(lx("aa" * 32), 0)
+    dest = KEYSTORE.p2wpkh_scriptpubkey("psbt_dest")
+    from bitcoin.core import CMutableTransaction
+    tx = CMutableTransaction()
+    tx.vin = [CTxIn(outpoint)]
+    tx.vout = [CTxOut(49_000, dest)]
+    return CTransaction.from_tx(tx)
+
+
+class TestPSBTCreation:
+    def test_from_unsigned_tx(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        assert psbt.num_inputs == 1
+        assert psbt.num_outputs == 1
+        assert psbt.is_finalized is False
+
+    def test_rejects_signed_tx(self):
+        """A tx with non-empty scriptSig should be rejected."""
+        from bitcoin.core import CMutableTransaction
+        tx = CMutableTransaction()
+        tx.vin = [CTxIn(COutPoint(lx("bb" * 32), 0),
+                        scriptSig=CScript(b"\x01\x02\x03"))]
+        tx.vout = [CTxOut(49_000, CScript(b"\x00\x14" + b"\x00" * 20))]
+        with pytest.raises(ValueError, match="scriptSig"):
+            PSBT.from_unsigned_tx(CTransaction.from_tx(tx))
+
+    def test_for_htlc(self):
+        sender = KEYSTORE.pubkey("psbt_htlc_s")
+        recipient = KEYSTORE.pubkey("psbt_htlc_r")
+        h = hashlib.sha256(b"psbt_htlc").digest()
+        htlc = RealHTLCScript(sender, recipient, h)
+        fund_outpoint = COutPoint(lx("cc" * 32), 0)
+        fund_tx = RealTransactionBuilder.build_funding_tx(
+            fund_outpoint, htlc, 50_000,
+        )
+        dest = KEYSTORE.p2wpkh_scriptpubkey("psbt_htlc_dest")
+        psbt = PSBT.for_htlc(
+            fund_tx.GetTxid(), 0, htlc, 50_000, dest,
+        )
+        assert psbt.num_inputs == 1
+        # Witness script should be pre-filled
+        summary = psbt.summary()
+        assert summary["input_details"][0]["has_witness_script"] is True
+
+
+class TestPSBTSigning:
+    def test_add_signature(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pubkey_hex = KEYSTORE.pubkey("psbt_sig").hex()
+        fake_sig = b"\x30" * 72  # DER-ish
+        psbt.add_signature(0, pubkey_hex, fake_sig)
+        assert psbt.input_has_sig(0, pubkey_hex)
+        assert psbt.input_sig_count(0) == 1
+
+    def test_add_signature_rejects_empty(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pubkey_hex = KEYSTORE.pubkey("psbt_empty").hex()
+        with pytest.raises(ValueError, match="empty"):
+            psbt.add_signature(0, pubkey_hex, b"")
+
+    def test_sign_input_ecdsa(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        msg = hashlib.sha256(b"psbt_sign_test").digest()
+        psbt.sign_input(0, "psbt_signer", msg)
+        pubkey_hex = KEYSTORE.pubkey("psbt_signer").hex()
+        assert psbt.input_has_sig(0, pubkey_hex)
+
+    def test_sign_input_schnorr(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        msg = hashlib.sha256(b"psbt_schnorr_test").digest()
+        psbt.sign_input(0, "psbt_schnorr", msg, schnorr=True)
+        pubkey_hex = KEYSTORE.x_only_pubkey("psbt_schnorr").hex()
+        assert psbt.input_has_sig(0, pubkey_hex)
+
+
+class TestPSBTCombine:
+    def test_combine_two(self):
+        tx = _make_unsigned_tx()
+        p1 = PSBT.from_unsigned_tx(tx)
+        p2 = PSBT.from_unsigned_tx(tx)
+        pk1 = KEYSTORE.pubkey("psbt_c1").hex()
+        pk2 = KEYSTORE.pubkey("psbt_c2").hex()
+        p1.add_signature(0, pk1, b"\x30" * 72)
+        p2.add_signature(0, pk2, b"\x31" * 72)
+        combined = PSBT.combine([p1, p2])
+        assert combined.input_sig_count(0) == 2
+        assert combined.input_has_sig(0, pk1)
+        assert combined.input_has_sig(0, pk2)
+
+    def test_combine_rejects_different_tx(self):
+        tx1 = _make_unsigned_tx()
+        # Different outpoint → different tx
+        from bitcoin.core import CMutableTransaction
+        tx2m = CMutableTransaction()
+        tx2m.vin = [CTxIn(COutPoint(lx("ff" * 32), 1))]
+        tx2m.vout = [CTxOut(48_000, CScript(b"\x00\x14" + b"\x00" * 20))]
+        tx2 = CTransaction.from_tx(tx2m)
+        p1 = PSBT.from_unsigned_tx(tx1)
+        p2 = PSBT.from_unsigned_tx(tx2)
+        with pytest.raises(ValueError, match="different"):
+            PSBT.combine([p1, p2])
+
+    def test_combine_single(self):
+        tx = _make_unsigned_tx()
+        p = PSBT.from_unsigned_tx(tx)
+        assert PSBT.combine([p]) is p
+
+
+class TestPSBTFinalize:
+    def test_finalize_and_extract(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pk_hex = KEYSTORE.pubkey("psbt_fin").hex()
+        psbt.add_signature(0, pk_hex, b"\x30" * 72)
+        psbt.finalize_input(0)
+        extracted = psbt.extract()
+        assert isinstance(extracted, CTransaction)
+
+    def test_finalize_clears_partial_sigs(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pk_hex = KEYSTORE.pubkey("psbt_clr").hex()
+        psbt.add_signature(0, pk_hex, b"\x30" * 72)
+        psbt.finalize_input(0)
+        assert psbt.input_sig_count(0) == 0  # cleared
+
+    def test_finalize_with_custom_witness_builder(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pk_hex = KEYSTORE.pubkey("psbt_wb").hex()
+        psbt.add_signature(0, pk_hex, b"\x30" * 72)
+        psbt.update_input(0, witness_script=b"\xab\xcd")
+
+        def custom_builder(sigs, witness_script):
+            sig = next(iter(sigs.values()))
+            return [sig, b"\x01", witness_script]
+
+        psbt.finalize_input(0, witness_builder=custom_builder)
+        extracted = psbt.extract()
+        assert isinstance(extracted, CTransaction)
+
+    def test_finalize_rejects_unsigned_input(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        with pytest.raises(ValueError, match="no partial signatures"):
+            psbt.finalize_input(0)
+
+    def test_finalize_all(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pk_hex = KEYSTORE.pubkey("psbt_all").hex()
+        psbt.add_signature(0, pk_hex, b"\x30" * 72)
+        psbt.finalize_all()
+        assert psbt.is_finalized is True
+
+    def test_cannot_modify_after_finalize(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        pk_hex = KEYSTORE.pubkey("psbt_lock").hex()
+        psbt.add_signature(0, pk_hex, b"\x30" * 72)
+        psbt.finalize_all()
+        with pytest.raises(RuntimeError, match="finalized"):
+            psbt.add_signature(0, pk_hex, b"\x30" * 72)
+
+
+class TestPSBTSerialization:
+    def test_base64_roundtrip(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        b64 = psbt.to_base64()
+        assert isinstance(b64, str)
+        restored = PSBT.from_base64(b64)
+        assert restored.num_inputs == psbt.num_inputs
+        assert restored.num_outputs == psbt.num_outputs
+
+    def test_invalid_base64(self):
+        import base64
+        bad = base64.b64encode(b"not_a_psbt").decode()
+        with pytest.raises(ValueError, match="magic"):
+            PSBT.from_base64(bad)
+
+    def test_summary(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        s = psbt.summary()
+        assert s["inputs"] == 1
+        assert s["outputs"] == 1
+        assert s["finalized"] is False
+
+
+class TestPSBTUpdate:
+    def test_update_input_metadata(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        psbt.update_input(0, utxo_amount=50_000,
+                          witness_script=b"\x00\x01\x02")
+        s = psbt.summary()
+        assert s["input_details"][0]["utxo_sats"] == 50_000
+        assert s["input_details"][0]["has_witness_script"] is True
+
+    def test_update_output_metadata(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        psbt.update_output(0, witness_script=b"\xab\xcd")
+        # No assertion error = success (output metadata is internal)
+
+    def test_index_out_of_range(self):
+        tx = _make_unsigned_tx()
+        psbt = PSBT.from_unsigned_tx(tx)
+        with pytest.raises(IndexError):
+            psbt.update_input(99, utxo_amount=1000)
